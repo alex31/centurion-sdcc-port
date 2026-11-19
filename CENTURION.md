@@ -16,6 +16,7 @@ r17105, Git commit `f966b0004c76eb960ce61c06fabecacf3916aa94`. The
 - Dead-code elimination clears the address use when it removes an indirect
   store from an unreachable block. The test suite compiles a standalone
   reproducer with the narrowing assertion enabled.
+- The CPU6 backend diagnoses bit-field reads and writes as unsupported.
 - Opt-in modes add software IEEE-754 binary32 and native 48-bit integers.
   The frontend accepts CPU6 MMU placement attributes and operand-aware inline
   assembly. The distribution supplies the corresponding runtimes and drivers.

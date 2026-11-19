@@ -1724,6 +1724,10 @@ static void pointer_get (iCode *ic)
 
 static void pointer_set (iCode *ic)
 {
+  sym_link *target = operandType (ic->result);
+  if (IS_PTR (target) && IS_BITFIELD (target->next))
+    unsupported ("bitfield access");
+
   unsigned size = width (ic->right);
   int offset = ic->left ? (int)operandLitValue (ic->left) : 0;
   cpu6_slot *slot = IS_SYMOP (ic->result) ? slot_for (OP_SYMBOL (ic->result)) : NULL;
