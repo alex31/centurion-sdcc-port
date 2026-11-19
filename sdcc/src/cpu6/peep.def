@@ -128,6 +128,27 @@ replace restart {
     xfr %1,b
 } if canAssign('b' %1)
 
+// Word arithmetic accepts index registers. The final transfer sets N/Z
+// from the sum and preserves the arithmetic carry and overflow flags.
+replace restart {
+    xfr %1,b
+    add %2,b
+    xfr b,%1
+} by {
+    add %2,%1
+} if same(%1 'x' 'y' 'z'), same(%2 'a' 'x' 'y' 'z'), notUsed('b')
+
+// SAB leaves the left operand in A and the difference in B. Use the
+// original index register if the load can leave it in place and A is dead.
+replace restart {
+    xfr %1,a
+    ldb %2
+    sab
+} by {
+    ldb %2
+    sub %1,b
+} if same(%1 'x' 'y' 'z'), canAssign('a' %2 'independent-address'), notVolatile(), notUsed('a')
+
 replace restart {
     stb %1
     ldb %1
