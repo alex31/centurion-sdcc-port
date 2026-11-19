@@ -1026,7 +1026,8 @@ printIvalBitFields (symbol ** sym, initList ** ilist, struct dbuf_s *oBuf)
               werror (W_LIT_OVERFLOW);
             }
 
-          ival |= (ullFromVal (val) & (0xffffffffffffffffull >> (64 - bit_length))) << bit_start;
+          unsigned long long bits = IS_BOOLEAN (lsym->etype) ? val && floatFromVal (val) != 0 : ullFromVal (val);
+          ival |= (bits & (0xffffffffffffffffull >> (64 - bit_length))) << bit_start;
           lilist = lilist ? lilist->next : NULL;
         }
       bit_start += bit_length;
@@ -1164,7 +1165,15 @@ printIvalStruct (symbol *sym, sym_link *type, initList *ilist, struct dbuf_s *oB
         {
           printIvalPad (oBuf);
         }
-      printIval (sym, sflds->type, iloop, oBuf, 1);
+      if (TARGET_IS_CPU6 && IS_BITFIELD (sflds->type))
+        {
+          /* A union field uses the same packed bytes as a structure field. */
+          symbol *field = sflds;
+          initList *init = iloop;
+          printIvalBitFields (&field, &init, oBuf);
+        }
+      else
+        printIval (sym, sflds->type, iloop, oBuf, 1);
       /* pad out with zeros if necessary */
       size = getSize(type) - sflds->offset - getSize(sflds->type);
       for ( ; size > 0 ; size-- )

@@ -177,7 +177,7 @@ static unsigned width (operand *op)
 static bool unsigned_op (operand *op)
 {
   sym_link *type = operandType (op);
-  return IS_PTR (type) || IS_ARRAY (type) || IS_UNSIGNED (type) || IS_BOOL (type);
+  return IS_PTR (type) || IS_ARRAY (type) || IS_UNSIGNED (type) || IS_BOOLEAN (type);
 }
 
 static cpu6_slot *slot_for (symbol *sym)
@@ -1694,10 +1694,43 @@ static void pointer_access (const char *mnemonic, cpu6_slot *slot, char reg, int
     emit ("\t%s (%c)\n", mnemonic, reg);
 }
 
+static unsigned bitfield_mask (sym_link *field)
+{
+  unsigned length = SPEC_BLEN (field), start = SPEC_BSTR (field);
+  if (!length || length > 16 || (start && start + length > 8))
+    unsupported ("bit-field layout");
+  return (1UL << length) - 1;
+}
+
+/* SDCC packs fields from the low bits of each byte. Multi-byte fields
+   have their low byte first even on CPU6, whose ordinary words are big-endian. */
+static void bitfield_get (sym_link *field, cpu6_slot *slot, char reg, int offset)
+{
+  unsigned mask = bitfield_mask (field);
+  unsigned length = SPEC_BLEN (field), start = SPEC_BSTR (field);
+  if (length > 8 && reg == 'b') {
+    emit ("\txfr b,a\n");
+    reg = 'a';
+  }
+  pointer_access ("ldbb", slot, reg, offset);
+  if (length > 8) {
+    pointer_access ("ldab", slot, reg, offset + 1);
+    emit ("\txfrb al,bh\n");
+  }
+  if (!SPEC_USIGN (field) && !IS_BOOLEAN (field)) {
+    if (length + start < 16) emit ("\tslr b,%u\n", 16 - length - start);
+    if (length < 16) emit ("\tsrr b,%u\n", 16 - length);
+  } else {
+    if (length <= 8) emit ("\tclrb bh\n");
+    if (start) emit ("\tsrr b,%u\n", start);
+    if (length + start < (length <= 8 ? 8U : 16U)) emit ("\tlda %u\n\tnab\n", mask);
+  }
+}
+
 static void pointer_get (iCode *ic)
 {
   unsigned size = width (ic->result);
-  if (IS_BITFIELD (operandType (ic->result))) unsupported ("bitfield access");
+  sym_link *type = operandType (ic->result);
   int offset = ic->right ? (int)operandLitValue (ic->right) : 0;
   cpu6_slot *slot = IS_SYMOP (ic->left) ? slot_for (OP_SYMBOL (ic->left)) : NULL;
   char reg = word_register (ic->left);
@@ -1709,29 +1742,77 @@ static void pointer_get (iCode *ic)
       offset = 0;
     }
   }
-  if (size >= 4) {
-    pointer_access ("lda", slot, reg, offset);
-    emit ("\tsta (__hireg)\n");
-    if (size == 6) {
-      pointer_access ("lda", slot, reg, offset + 2);
-      emit ("\tsta (__cpu6_mid48)\n");
+  if (IS_BITFIELD (type)) bitfield_get (type, slot, reg, offset);
+  else {
+    if (size >= 4) {
+      pointer_access ("lda", slot, reg, offset);
+      emit ("\tsta (__hireg)\n");
+      if (size == 6) {
+        pointer_access ("lda", slot, reg, offset + 2);
+        emit ("\tsta (__cpu6_mid48)\n");
+      }
     }
+    pointer_access (size == 1 ? "ldbb" : "ldb", slot, reg, offset + (size >= 4 ? size - 2 : 0));
   }
-  pointer_access (size == 1 ? "ldbb" : "ldb", slot, reg, offset + (size >= 4 ? size - 2 : 0));
   b_cached = NULL;
   store (ic->result);
+}
+
+static void bitfield_store_byte (cpu6_slot *slot, char reg, int offset, unsigned mask)
+{
+  if (mask != 255) {
+    pointer_access ("ldab", slot, reg, offset);
+    emit ("\txfrb al,ah\n\tldab %u\n\tandb al,bl\n\tivrb al\n"
+          "\tandb al,ah\n\torib ah,bl\n", mask);
+  }
+  pointer_access ("stbb", slot, reg, offset);
+}
+
+static void bitfield_set (iCode *ic, sym_link *field, cpu6_slot *slot, char reg, int offset)
+{
+  unsigned start = SPEC_BSTR (field), mask = bitfield_mask (field) << start;
+  bool borrow_x = !(slot && slot->address_base) && (!reg || offset < -128 || offset > 126);
+  bool save_x = borrow_x && register_needed ('x');
+  if (borrow_x) {
+    load (ic->result, 2);
+    if (offset) emit ("\tlda %u\n\taab\n", (unsigned)offset & 65535);
+    emit ("\tstb (-s)\n");
+    pushed += 2;
+    offset = 0;
+    reg = 'x';
+  }
+  load (ic->right, 2);
+  /* The RHS may itself need X to reach a distant frame slot. Stage the
+     address until it is loaded, then replace the address with X if live. */
+  if (save_x) emit ("\tlda (s)\n\tstx (s)\n\txfr a,x\n");
+  else if (borrow_x) {
+    emit ("\tldx (s+)\n");
+    pushed -= 2;
+  }
+  if (start) emit ("\tslrb bl,%u\n", start);
+  bitfield_store_byte (slot, reg, offset, mask & 255);
+  if (SPEC_BLEN (field) > 8) {
+    emit ("\txfrb bh,bl\n");
+    bitfield_store_byte (slot, reg, offset + 1, mask >> 8);
+  }
+  if (save_x) {
+    emit ("\tldx (s+)\n");
+    pushed -= 2;
+  }
+  b_cached = NULL;
 }
 
 static void pointer_set (iCode *ic)
 {
   sym_link *target = operandType (ic->result);
-  if (IS_PTR (target) && IS_BITFIELD (target->next))
-    unsupported ("bitfield access");
-
-  unsigned size = width (ic->right);
   int offset = ic->left ? (int)operandLitValue (ic->left) : 0;
   cpu6_slot *slot = IS_SYMOP (ic->result) ? slot_for (OP_SYMBOL (ic->result)) : NULL;
   char reg = word_register (ic->result);
+  if (IS_PTR (target) && IS_BITFIELD (target->next)) {
+    bitfield_set (ic, target->next, slot, reg, offset);
+    return;
+  }
+  unsigned size = width (ic->right);
   bool stacked_pointer = !reg && !(slot && slot->address_base) && size >= 4;
   bool save_x = stacked_pointer && register_needed ('x');
   if (save_x) { emit ("\tstx (-s)\n"); pushed += 2; }
@@ -2200,6 +2281,8 @@ static void fold_indexed_accesses (ebbIndex *ebbi)
           !use || (!POINTER_SET (use) && use->op != GET_VALUE_AT_ADDRESS))
         continue;
       bool write = POINTER_SET (use);
+      /* The pointer's pointee identifies a packed field on a store. */
+      if (write && IS_BITFIELD (operandType (use->result)->next)) continue;
       operand **addr = write ? &use->result : &use->left;
       operand **disp = write ? &use->left : &use->right;
       if (!IS_SYMOP ((*addr)) || OP_SYMBOL (*addr) != OP_SYMBOL (ic->result) ||

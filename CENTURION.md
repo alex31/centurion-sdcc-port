@@ -16,7 +16,12 @@ r17105, Git commit `f966b0004c76eb960ce61c06fabecacf3916aa94`. The
 - Dead-code elimination clears the address use when it removes an indirect
   store from an unreachable block. The test suite compiles a standalone
   reproducer with the narrowing assertion enabled.
-- The CPU6 backend diagnoses bit-field reads and writes as unsupported.
+- CPU6 supports C99 `_Bool`, `int`, `signed int` and `unsigned int`
+  bit-fields. Plain `int` fields are signed. Fields are allocated from the
+  low bits of each byte and start on the next byte when they would no
+  longer fit. Multi-byte fields store the least-significant byte first.
+  Reads extract and sign-extend the field when appropriate. Stores
+  preserve neighboring bits, including in volatile structures and unions.
 - Opt-in modes add software IEEE-754 binary32 and native 48-bit integers.
   The frontend accepts CPU6 MMU placement attributes and operand-aware inline
   assembly. The distribution supplies the corresponding runtimes and drivers.

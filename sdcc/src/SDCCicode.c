@@ -2856,7 +2856,7 @@ geniCodePostInc (operand * op)
     ic = newiCode ('+', srcOp, operandFromValue (constFloatVal ("1.0"), false));
   else if (IS_FIXED16X16 (rvtype))
     ic = newiCode ('+', srcOp, operandFromValue (constFixed16x16Val ("1.0"), false));
-  else if (IS_BOOL (rvtype))
+  else if (IS_BOOLEAN (rvtype))
     ic = newiCode ('=', NULL, operandFromLit (1));
   else
     ic = newiCode ('+', srcOp, operandFromLit (size));
@@ -2904,7 +2904,7 @@ geniCodePreInc (operand * op, bool lvalue)
     ic = newiCode ('+', rop, operandFromValue (constFloatVal ("1.0"), false));
   else if (IS_FIXED16X16 (roptype))
     ic = newiCode ('+', rop, operandFromValue (constFixed16x16Val ("1.0"), false));
-  else if (IS_BOOL (roptype))
+  else if (IS_BOOLEAN (roptype))
     ic = newiCode ('=', NULL, operandFromLit (1));
   else
     ic = newiCode ('+', rop, operandFromLit (size));
@@ -2913,7 +2913,8 @@ geniCodePreInc (operand * op, bool lvalue)
   ADDTOCHAIN (ic);
 
   (void) geniCodeAssign (op, result, 0, 0);
-  if (lvalue || (IS_TRUE_SYMOP (op) && !isOperandVolatile (op, false) && !optional_target) || IS_BITVAR (optype))
+  /* Read a bit-field expression after the store's width conversion. */
+  if (lvalue || (IS_TRUE_SYMOP (op) && !isOperandVolatile (op, false) && !optional_target) || IS_BITVAR (roptype))
     return op;
   else
     return result;
@@ -2969,7 +2970,7 @@ geniCodePostDec (operand * op)
     ic = newiCode ('-', srcOp, operandFromValue (constFloatVal ("1.0"), false));
   else if (IS_FIXED16X16 (rvtype))
     ic = newiCode ('-', srcOp, operandFromValue (constFixed16x16Val ("1.0"), false));
-  else if (IS_BOOL (rvtype))
+  else if (IS_BOOLEAN (rvtype))
     ic = newiCode ('!', srcOp, 0);
   else
     ic = newiCode ('-', srcOp, operandFromLit (size));
@@ -3017,7 +3018,7 @@ geniCodePreDec (operand * op, bool lvalue)
     ic = newiCode ('-', rop, operandFromValue (constFloatVal ("1.0"), false));
   else if (IS_FIXED16X16 (roptype))
     ic = newiCode ('-', rop, operandFromValue (constFixed16x16Val ("1.0"), false));
-  else if (IS_BOOL (roptype))
+  else if (IS_BOOLEAN (roptype))
     ic = newiCode ('!', rop, 0);
   else
     ic = newiCode ('-', rop, operandFromLit (size));
@@ -3026,7 +3027,7 @@ geniCodePreDec (operand * op, bool lvalue)
   ADDTOCHAIN (ic);
 
   (void) geniCodeAssign (op, result, 0, 0);
-  if (lvalue || (IS_TRUE_SYMOP (op) && !isOperandVolatile (op, false) && !optional_target) || IS_BITVAR (optype))
+  if (lvalue || (IS_TRUE_SYMOP (op) && !isOperandVolatile (op, false) && !optional_target) || IS_BITVAR (roptype))
     return op;
   else
     return result;

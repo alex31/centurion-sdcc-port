@@ -3325,6 +3325,7 @@ valCastLiteral (sym_link *dtype, double fval, TYPE_TARGET_ULONGLONG llval)
       break;
 
     case V_BOOL:
+    case V_BBITFIELD:
     case V_BIT:
     case V_SBIT:
       SPEC_CVAL (val->etype).v_uint = fval ? 1 : 0;
