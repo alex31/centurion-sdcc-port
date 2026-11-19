@@ -10,6 +10,9 @@ r17105, Git commit `f966b0004c76eb960ce61c06fabecacf3916aa94`. The
 - The optimizer adds auto-indexing, jump tables, tail calls, loop strength
   reduction and forwarding into A/B. The distribution drivers add
   assembly-level cross-file inlining and link-time section GC.
+- Dead-code elimination clears the address use when it removes an indirect
+  store from an unreachable block. The test suite compiles a standalone
+  reproducer with the narrowing assertion enabled.
 - Opt-in modes add software IEEE-754 binary32 and native 48-bit integers.
   The frontend accepts CPU6 MMU placement attributes and operand-aware inline
   assembly. The distribution supplies the corresponding runtimes and drivers.

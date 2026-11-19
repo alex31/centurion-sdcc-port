@@ -2101,11 +2101,17 @@ killiCode (eBBlock **ebbs, int i, int count, iCode *ic)
   bitVectUnSetBit (ebbs[i]->defSet, ic->key);
 
   if (ic->result)
-    bitVectUnSetBit (OP_DEFS (ic->result), ic->key);
+    {
+      // For an indirect store, the result operand is an input address.
+      if (POINTER_SET (ic))
+        bitVectUnSetBit (OP_USES (ic->result), ic->key);
+      else
+        bitVectUnSetBit (OP_DEFS (ic->result), ic->key);
+    }
 
   /* If this is the last of a register equivalent, */
   /* look for a successor register equivalent. */
-  if (IS_ITEMP (ic->result)
+  if (!POINTER_SET (ic) && IS_ITEMP (ic->result)
       && OP_SYMBOL (ic->result)->isreqv
       && bitVectIsZero (OP_DEFS (ic->result)))
     {
