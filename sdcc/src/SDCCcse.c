@@ -990,6 +990,14 @@ fixPointerReads (iCode *ic)
 static void
 algebraicOpts (iCode *ic, eBBlock *ebp)
 {
+  /* Integer identities such as x==x, x-x and x+0 are not valid for IEEE
+     NaNs, infinities and signed zero. Keep CPU6 float operations intact. */
+  if (TARGET_IS_CPU6 &&
+      ((ic->left && IS_FLOAT (operandType (ic->left))) ||
+       (ic->right && IS_FLOAT (operandType (ic->right)))) &&
+      (ic->op == '+' || ic->op == '-' || ic->op == '*' || ic->op == '/' ||
+       ic->op == EQ_OP || ic->op == NE_OP || ic->op == '<' || ic->op == '>' ||
+       ic->op == LE_OP || ic->op == GE_OP)) return;
   lineno = ic->lineno; // For error messages
 
   /* we don't deal with the following iCodes
@@ -1926,6 +1934,11 @@ DEFSETFUNC (diCodeForSym)
 int
 constFold (iCode * ic, set * cseSet)
 {
+  if (TARGET_IS_CPU6 &&
+      ((ic->left && IS_FLOAT (operandType (ic->left))) ||
+       (ic->right && IS_FLOAT (operandType (ic->right))) ||
+       (ic->result && IS_FLOAT (operandType (ic->result)))))
+    return 0; /* (x+c)-c need not equal x after binary32 rounding. */
   iCode *dic = NULL;
   iCode *ldic = NULL;
   /* this routine will change

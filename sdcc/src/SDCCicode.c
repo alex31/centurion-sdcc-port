@@ -710,7 +710,7 @@ newiCodeParm (int op, operand *left, value *param, sym_link *ftype, int *stack)
             (*stack)++;
           else if (IFFUNC_ISDYNAMICC (ftype) && getSize (argtype)  == 3 && IS_FARPTR (argtype)) // Dynamic C passes pointers to __far as 32 bits.
             (*stack)++;
-          else if (TARGET_PDK_LIKE && getSize (argtype) % 2) // pdk needs even-aligned stack.
+          else if ((TARGET_PDK_LIKE || TARGET_IS_CPU6) && getSize (argtype) % 2) // Word-sized stack arguments.
             (*stack)++;
         }
     }
@@ -2508,7 +2508,8 @@ geniCodeAdd (operand *left, operand *right, RESULT_TYPE resultType, int lvl)
 
   /* if the right side is LITERAL zero */
   /* return the left side              */
-  if (IS_LITERAL (retype) && right->isLiteral && !floatFromVal (valFromType (rtype)))
+  if (IS_LITERAL (retype) && right->isLiteral && !floatFromVal (valFromType (rtype)) &&
+      !(TARGET_IS_CPU6 && (IS_FLOAT (ltype) || IS_FLOAT (rtype))))
     {
       left = operandFromOperand (left);
       if (IS_PTR (ltype))
@@ -2517,7 +2518,8 @@ geniCodeAdd (operand *left, operand *right, RESULT_TYPE resultType, int lvl)
     }
 
   /* if left is literal zero return right */
-  if (!IS_PTR (ltype) && IS_LITERAL (letype) && left->isLiteral && !floatFromVal (valFromType (ltype)))
+  if (!IS_PTR (ltype) && IS_LITERAL (letype) && left->isLiteral && !floatFromVal (valFromType (ltype)) &&
+      !(TARGET_IS_CPU6 && (IS_FLOAT (ltype) || IS_FLOAT (rtype))))
     {
       right = operandFromOperand (right);
       if (IS_PTR (rtype))
@@ -3243,6 +3245,8 @@ geniCodeUnaryMinus (operand * op)
   iCode *ic;
   sym_link *optype = operandType (op);
 
+  if (TARGET_IS_CPU6 && IS_LITERAL (optype) && IS_FLOAT (optype))
+    return operandFromValue (valCastLiteral (optype, -floatFromVal (OP_VALUE (op)), 0), false);
   if (IS_LITERAL (optype))
     return operandFromLit (-floatFromVal (OP_VALUE (op)));
 
@@ -3371,7 +3375,7 @@ geniCodeLogic (operand * left, operand * right, int op, ast * tree)
   /* if comparing float
      and not a '==' || '!=' || '&&' || '||' (these
      will be inlined */
-  if (IS_FLOAT (ctype) && op != EQ_OP && op != NE_OP && op != AND_OP && op != OR_OP)
+  if (IS_FLOAT (ctype) && (TARGET_IS_CPU6 || (op != EQ_OP && op != NE_OP)) && op != AND_OP && op != OR_OP)
     ic->supportRtn = 1;
 
   /* if comparing a fixed type use support functions */
@@ -3860,6 +3864,7 @@ geniCodeCall (operand * left, ast * parms, int lvl)
   iCode *ic;
   sym_link *type, *etype;
   sym_link *ftype;
+  const char *asmText = NULL;
   int stack = 0;
   int iArg = 0;
 
@@ -3893,6 +3898,29 @@ geniCodeCall (operand * left, ast * parms, int lvl)
 
   if (IS_FUNCPTR (ftype))
     ftype = ftype->next;
+
+  value *argTypes = FUNC_ARGS (ftype);
+  if (TARGET_IS_CPU6 && IFFUNC_ISBUILTIN (ftype) && IS_SYMOP (left) &&
+      (!strcmp (OP_SYMBOL (left)->name, "__cpu6_asm16") ||
+       !strcmp (OP_SYMBOL (left)->name, "__cpu6_asm16_2")))
+    {
+      ast *literal = IS_AST_PARAM (parms) ? parms->left : NULL;
+      if (IS_CAST_OP (literal))
+        literal = literal->right;
+      symbol *str = literal && literal->type == EX_VALUE ? literal->opval.val->sym : NULL;
+      if (str && str->isstrlit && IS_ARRAY (str->type) && IS_CHAR (str->etype))
+        asmText = SPEC_CVAL (str->etype).v_char;
+      if (!asmText || strlen (asmText) + 1 != (size_t) DCL_ELEM (str->type))
+        {
+          fprintf (stderr, "%s:%u: error: CPU6 inline assembly requires a string literal without embedded NULs\n",
+                   lexFilename, (unsigned)lineno);
+          fatalError++;
+          return operandFromLit (0);
+        }
+      /* The template is compile-time data. Only the word operands are sent. */
+      parms = parms->right;
+      argTypes = argTypes->next;
+    }
 
   /* take care of parameters with side-effecting
      function calls in them, this is required to take care
@@ -3928,7 +3956,7 @@ geniCodeCall (operand * left, ast * parms, int lvl)
     }
   else
     {
-      geniCodeParms (parms, FUNC_ARGS (ftype), &iArg, &stack, ftype, lvl, 0);
+      geniCodeParms (parms, argTypes, &iArg, &stack, ftype, lvl, 0);
     }
 
   /* now call : if symbol then pcall */
@@ -3950,6 +3978,7 @@ geniCodeCall (operand * left, ast * parms, int lvl)
 
   /* stack adjustment after call */
   ic->parmBytes = stack;
+  ic->inlineAsm = asmText;
 
   if (!IS_STRUCT (type))
     {
@@ -4178,7 +4207,7 @@ int
 geniCodeJumpTable (operand * cond, value * caseVals, ast * tree)
 {
   int min, max, cnt = 1;
-  int i, t;
+  int t;
   value *vch, *maxVal;
   iCode *ic;
   symbol *falseLabel;
@@ -4208,10 +4237,8 @@ geniCodeJumpTable (operand * cond, value * caseVals, ast * tree)
   max = (int) ulFromVal (vch);
   maxVal = vch;
 
-  if (max-min < 0)
-    return 0;
-  /* Exit if the range is too large to handle with a jump table. */
-  if (1 + max - min > port->jumptableCost.maxCount)
+  /* The difference of two case labels need not fit in a host int. */
+  if (max < min || (unsigned)max - (unsigned)min >= (unsigned)port->jumptableCost.maxCount)
     return 0;
 
   switch (getSize (operandType (cond)))
@@ -4246,21 +4273,15 @@ geniCodeJumpTable (operand * cond, value * caseVals, ast * tree)
   /* If the size cost of handling a non-zero minimum exceeds the */
   /* cost of extending the range down to zero, then it might be */
   /* better to extend the range to zero. */
-  if (min > 0 && (sizeofMinCost - sizeofZeroMinCost) >= (min * port->jumptableCost.sizeofElement))
+  if (min > 0 && max < port->jumptableCost.maxCount &&
+      (sizeofMinCost - sizeofZeroMinCost) >= (min * port->jumptableCost.sizeofElement))
     {
-      /* Only extend the jump table if it would still be manageable. */
-      if (1 + max <= port->jumptableCost.maxCount)
-        {
-          min = 0;
-          if (IS_UNSIGNED (cetype))
-            sizeofMinCost = 0;
-          else
-            sizeofMinCost = port->jumptableCost.sizeofRangeCompare[sizeIndex];
-        }
+      min = 0;
+      sizeofMinCost = sizeofZeroMinCost;
     }
 
   /* Compute the total size cost of a jump table. */
-  sizeofJumpTable = (1 + max - min) * port->jumptableCost.sizeofElement
+  sizeofJumpTable = ((max - min) + 1) * port->jumptableCost.sizeofElement
     + port->jumptableCost.sizeofDispatch + sizeofMinCost + sizeofMaxCost;
 
   /* Compute the total size cost of a match & jump sequence */
@@ -4295,8 +4316,9 @@ geniCodeJumpTable (operand * cond, value * caseVals, ast * tree)
   /* Build the list of labels for the jump table. */
   vch = caseVals;
   t = (int) ulFromVal (vch);
-  for (i = min; i <= max; i++)
+  for (int offset = 0; offset <= max - min; offset++)
     {
+      int i = min + offset;
       if (vch && t == i)
         {
           dbuf_init (&dbuf, 128);

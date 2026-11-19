@@ -3243,8 +3243,28 @@ matchLine (char *s, const char *d, hTab ** vars)
                   return false;
             }
           else
-            /* variable not bound we need to bind it */
-            bindVar (keyForVar (d + 1), &s, vars);
+            {
+              /* CPU6 writes displacement(base) and (base+). The ordinary
+                 operand capture deliberately includes balanced parentheses,
+                 so it cannot split these two patterns at their delimiters. */
+              const char *after = d + 1;
+              while (ISCHARDIGIT (*after)) after++;
+              if (TARGET_IS_CPU6 && (*after == '(' || *after == '+'))
+                {
+                  char prefix[MAX_PATTERN_LEN], *capture = prefix;
+                  const char *end = s;
+                  while (*end && *end != *after && !ISCHARSPACE (*end) &&
+                         *end != ',' && *end != ')' && *end != ';') end++;
+                  size_t length = end - s;
+                  if (*end != *after || !length || length >= sizeof (prefix))
+                    return false;
+                  memcpy (prefix, s, length); prefix[length] = 0;
+                  bindVar (keyForVar (d + 1), &capture, vars);
+                  s += length;
+                }
+              else
+                bindVar (keyForVar (d + 1), &s, vars);
+            }
 
           /* in either case go past the variable */
           d++;

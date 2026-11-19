@@ -1155,8 +1155,11 @@ loopInduction (region * loopReg, ebbIndex * ebbi)
           operand *litSym;
           long litVal;
 
-          /* consider only * & / */
-          if (ic->op != '*' && ic->op != '/')
+          /* CPU6 has native multiply, but a word recurrence is still cheaper
+             than multiplying a loop index on every iteration. Its shifts
+             are also candidates once their target cost exceeds an add. */
+          bool cpu6Shift = TARGET_IS_CPU6 && ic->op == LEFT_OP;
+          if (ic->op != '*' && ic->op != '/' && !cpu6Shift)
             continue;
 
           /* only consider variables with integral type */
@@ -1181,7 +1184,7 @@ loopInduction (region * loopReg, ebbIndex * ebbi)
           else
             {
               /* For division, the literal must not be on the left side */
-              if (ic->op == '/')
+              if (ic->op == '/' || cpu6Shift)
                 continue;
               aSym = IC_RIGHT (ic);
               litSym = IC_LEFT (ic);
@@ -1193,9 +1196,62 @@ loopInduction (region * loopReg, ebbIndex * ebbi)
           if (!applyToSetFTrue (basicInd, findInduction, aSym, &ip))
             continue;
 
-          /* ask port for size not worth if native instruction
-             exist for multiply & divide */
-          if (port->hasNativeMulFor (ic, operandType (IC_LEFT (ic)), operandType (IC_RIGHT (ic))))
+          if (TARGET_IS_CPU6)
+            {
+              extern int cpu6_no_loop_strength;
+              /* Equal-width modular multiplication commutes with a word
+                 induction update. Narrow/widening recurrences do not: an
+                 8-bit index wrapping at 255 must not turn into a 16-bit IV.
+                 Divisions and signed overflow remain on the original path. */
+              if (cpu6_no_loop_strength || optimize.codeSize ||
+                  (ic->op != '*' && !cpu6Shift) ||
+                  getSize (operandType (aSym)) != 2 ||
+                  getSize (operandType (IC_RESULT (ic))) != 2 ||
+                  !IS_UNSIGNED (operandType (aSym)) ||
+                  !IS_UNSIGNED (operandType (IC_RESULT (ic))) ||
+                  isOperandVolatile (aSym, false) ||
+                  isOperandVolatile (IC_RESULT (ic), false))
+                continue;
+              if (cpu6Shift)
+                {
+                  if (litVal < 3 || litVal >= 16) continue;
+                  litVal = 1L << litVal;
+                }
+              else if (litVal <= 2 || litVal > 65535)
+                continue;
+              /* Keep the derivation and the unique IV update in the same
+                 straight-line block, in that order. This excludes conditional
+                 updates, post-update values and backedges bypassing the use. */
+              owner = NULL;
+              dic = findDefInRegion (setFromSet (loopReg->regBlocks), aSym, &owner);
+              if (!dic || owner != lBlock) continue;
+              iCode *after;
+              for (after = ic->next; after && after != dic; after = after->next) ;
+              if (!after) continue;
+              /* The original derived value may be consumed after the base
+                 increment, or escape to a successor. Updating it at dic
+                 would then change that use to the next iteration's value.
+                 Require every read to lie strictly between the definition
+                 and the increment, in this same straight-line block. */
+              bool usesBeforeUpdate = IS_ITEMP (IC_RESULT (ic));
+              for (int bi = 0; bi < ebbi->count && usesBeforeUpdate; bi++)
+                {
+                  eBBlock *bb = ebbi->bbOrder[bi];
+                  bool inWindow = false;
+                  for (iCode *use = bb->sch; use; use = use->next)
+                    {
+                      if (use == dic) inWindow = false;
+                      if (use != ic &&
+                          ((use->left && isOperandEqual (use->left, IC_RESULT (ic))) ||
+                           (use->right && isOperandEqual (use->right, IC_RESULT (ic))) ||
+                           (POINTER_SET (use) && isOperandEqual (use->result, IC_RESULT (ic)))))
+                        if (!inWindow) { usesBeforeUpdate = false; break; }
+                      if (use == ic) inWindow = true;
+                    }
+                }
+              if (!usesBeforeUpdate) continue;
+            }
+          else if (port->hasNativeMulFor (ic, operandType (IC_LEFT (ic)), operandType (IC_RIGHT (ic))))
             continue;
 
           /* if this is a division then the remainder should be zero
@@ -1216,7 +1272,7 @@ loopInduction (region * loopReg, ebbIndex * ebbi)
           OP_SYMBOL (IC_RESULT (indIc))->isind = 1;
 
           /* keep track of the inductions */
-          litVal = (ic->op == '*' ? (litVal * ip->cval) : (ip->cval / litVal));
+          litVal = (ic->op == '*' || cpu6Shift ? (litVal * ip->cval) : (ip->cval / litVal));
 
           addSet (&indVars, newInduction (IC_RESULT (ic), ip->op, litVal, indIc, NULL));
 

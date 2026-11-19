@@ -11,6 +11,7 @@
 #include "dbuf.h"
 
 enum target {
+  TARGET_ID_CPU6 = 100,
   TARGET_ID_MCS51 = 1,
   TARGET_ID_DS390,
   TARGET_ID_DS400,
@@ -46,6 +47,7 @@ enum target {
 /* Macro to test the target we are compiling for.
    Can only be used after SDCCmain has defined the port
  */
+#define TARGET_IS_CPU6     (port->id == TARGET_ID_CPU6)
 #define TARGET_IS_MCS51    (port->id == TARGET_ID_MCS51)
 #define TARGET_IS_DS390    (port->id == TARGET_ID_DS390)
 #define TARGET_IS_DS400    (port->id == TARGET_ID_DS400)
@@ -537,6 +539,10 @@ extern PORT f8_port;
 #endif
 #if !OPT_DISABLE_F8L
 extern PORT f8l_port;
+#endif
+
+#if !OPT_DISABLE_CPU6
+extern PORT cpu6_port;
 #endif
 
 #endif /* PORT_INCLUDE */

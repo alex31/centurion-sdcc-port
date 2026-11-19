@@ -1052,6 +1052,13 @@ processParms (ast * func, value * defParm, ast ** actParm, int *parmNumber,     
 
       ftype = (*actParm)->ftype;
 
+      if (TARGET_IS_CPU6 && IS_FLOAT (ftype))
+        {
+          werrorfl ((*actParm)->filename, (*actParm)->lineno, E_SYNTAX_ERROR,
+                    "CPU6 float32 requires a typed parameter; variadic/default promotion to double is unsupported");
+          return 1;
+        }
+
       resultType = RESULT_TYPE_NONE;
 
       /* If it's a char, upcast to int. */
@@ -1852,6 +1859,12 @@ gatherAutoInit (symbol * autoChain, ast * block, int *stack)
 
       /* resolve the symbols in the ival */
       resolveIvalSym (sym->ival, sym->type);
+
+      /* CPU6 loads initialized RAM from the executable; there is no startup
+         instruction stream for static locals. Keep their resolved initializer
+         for cpu6_glue, just as for a file-scope object. */
+      if (TARGET_IS_CPU6 && IS_STATIC (sym->etype))
+        continue;
 
 #if 1
       /* if we are PIC14 or PIC16 port,
@@ -2917,6 +2930,10 @@ createDoFor (symbol * trueLabel, symbol * continueLabel, symbol * falseLabel,
 static ast *
 searchLitOp (ast * tree, ast ** parent, const char *ops)
 {
+  if (TARGET_IS_CPU6 && tree &&
+      (IS_FLOAT (tree->ftype) || (tree->left && IS_FLOAT (tree->left->ftype)) ||
+       (tree->right && IS_FLOAT (tree->right->ftype))))
+    return NULL; /* Reassociation changes binary32 rounding and specials. */
   ast *ret;
 
   if (tree && optimize.global_cse)
@@ -4609,7 +4626,8 @@ decorateType (ast *tree, RESULT_TYPE resultType, bool reduceTypeAllowed)
       propagateConstExpr (&tree->right, resultType, reduceTypeAllowed);
 
       /* check if div by zero */
-      if (IS_LITERAL (RTYPE (tree)) && !IS_LITERAL (LTYPE (tree)))
+      if (IS_LITERAL (RTYPE (tree)) && !IS_LITERAL (LTYPE (tree)) &&
+          !(TARGET_IS_CPU6 && (IS_FLOAT (LTYPE (tree)) || IS_FLOAT (RTYPE (tree)))))
         checkZero (valFromType (RETYPE (tree)));
       /* if they are both literal then */
       /* rewrite the tree */
@@ -5020,6 +5038,7 @@ decorateType (ast *tree, RESULT_TYPE resultType, bool reduceTypeAllowed)
       /* if the left & right are equal then zero */
       if (!hasSEFcalls(tree->left) && !hasSEFcalls(tree->right) &&
         isAstEqual (tree->left, tree->right) &&
+        !(TARGET_IS_CPU6 && (IS_FLOAT (LTYPE (tree)) || IS_FLOAT (RTYPE (tree)))) &&
         !(IS_PTR (LTYPE (tree)) && isOptional (LTYPE (tree)->next)))
         {
           tree->type = EX_VALUE;
@@ -5854,11 +5873,11 @@ decorateType (ast *tree, RESULT_TYPE resultType, bool reduceTypeAllowed)
               transformedOp = LE_OP;
             break;
           case LE_OP:          /* transform (a <= b) to !(a > b)   */
-            if (port->le_ngt)
+            if (port->le_ngt && !(TARGET_IS_CPU6 && (IS_FLOAT (LTYPE (tree)) || IS_FLOAT (RTYPE (tree)))))
               transformedOp = '>';
             break;
           case GE_OP:          /* transform (a >= b) to !(a < b)   */
-            if (port->ge_nlt)
+            if (port->ge_nlt && !(TARGET_IS_CPU6 && (IS_FLOAT (LTYPE (tree)) || IS_FLOAT (RTYPE (tree)))))
               transformedOp = '<';
             break;
           case NE_OP:          /* transform (a != b) to !(a == b)   */
@@ -6139,6 +6158,13 @@ decorateType (ast *tree, RESULT_TYPE resultType, bool reduceTypeAllowed)
       return tree;
 
     case ':':
+      /* sizeof/typeof must observe the usual integer promotions, even when
+         both alternatives would fit in a narrower computation type. */
+      if (!reduceTypeAllowed && IS_INTEGRAL (LTYPE (tree)) && IS_INTEGRAL (RTYPE (tree)))
+        {
+          tree->left = addCast (tree->left, RESULT_TYPE_NONE, true);
+          tree->right = addCast (tree->right, RESULT_TYPE_NONE, true);
+        }
       /* Castability alone does not satisfy the conditional operator's
          requirement for compatible referenced types. */
       if (needsPtrTargetTypeWarning (LTYPE (tree), RTYPE (tree)))
@@ -7439,6 +7465,8 @@ optimizeCompare (ast * root)
 
   /* if left & right are the same then depending
      of the operation do */
+  if (TARGET_IS_CPU6 && (IS_FLOAT (LTYPE (root)) || IS_FLOAT (RTYPE (root))))
+    return root;
   if (isAstEqual (root->left, root->right) && !hasSEFcalls (root))
     {
       switch (root->opval.op)
@@ -7611,6 +7639,161 @@ copyAstLoc (ast * dest, ast * src)
 
 static void fixupInline (ast * tree, long level);
 
+/* Preserve the declaration-time binding of free global names. In particular,
+   findSymWithLevel accepts caller parameters before considering sequence
+   points; rebasing a global reference can otherwise capture such a parameter.
+   Leave local names for the existing inline parameter/local remapping. */
+static void cpu6BindInlineGlobals (ast *tree);
+
+/* Counting the untyped tree keeps this independent of register allocation.
+   Small calls are allowed, but recursion, assembly and local objects with
+   identity/lifetime requirements stay out of the automatic heuristic. */
+#if !OPT_DISABLE_CPU6
+extern int cpu6_no_auto_inline;
+extern int cpu6_leaf_inline_only;
+#endif
+static unsigned cpu6InlineBudget;
+static symbol *cpu6CostFunction;
+static symbol *cpu6InlineStack[16];
+static unsigned cpu6InlineDepth;
+static bool
+cpu6InlineActive (symbol *func)
+{
+  if (cpu6InlineDepth == 16) return true;
+  for (unsigned i = 0; i < cpu6InlineDepth; i++)
+    if (!strcmp (cpu6InlineStack[i]->name, func->name)) return true;
+  return false;
+}
+static bool cpu6InlineCost (ast *tree, unsigned *nodes, unsigned *cost);
+
+static bool
+cpu6InlineInitializerCost (initList *list, unsigned *nodes, unsigned *cost)
+{
+  for (; list; list = list->next)
+    if (list->type == INIT_NODE && !cpu6InlineCost (list->init.node, nodes, cost)) return false;
+    else if (list->type == INIT_DEEP && !cpu6InlineInitializerCost (list->init.deep, nodes, cost)) return false;
+  return true;
+}
+
+static bool
+cpu6InlineCost (ast *tree, unsigned *nodes, unsigned *cost)
+{
+  if (!tree) return true;
+  if (++*nodes > 256) return false;
+  if (IS_AST_OP (tree))
+    {
+      switch (tree->opval.op)
+        {
+        case CALL:
+#if !OPT_DISABLE_CPU6
+          if (cpu6_leaf_inline_only) return false;
+#endif
+          if (IS_AST_SYM_VALUE (tree->left) && cpu6CostFunction &&
+              !strcmp (AST_SYMBOL (tree->left)->name, cpu6CostFunction->name)) return false;
+          *cost += 8;
+          break;
+        case PCALL: case INLINEASM: case CRITICAL: return false;
+        case BLOCK:
+          for (symbol *decl = tree->values.sym; decl; decl = decl->next)
+            if (IS_STATIC (decl->etype) || IS_AGGREGATE (decl->type) ||
+                !cpu6InlineInitializerCost (decl->ival, nodes, cost)) return false;
+          break;
+        case FOR:
+          if (!cpu6InlineCost (AST_FOR (tree, initExpr), nodes, cost) ||
+              !cpu6InlineCost (AST_FOR (tree, condExpr), nodes, cost) ||
+              !cpu6InlineCost (AST_FOR (tree, loopExpr), nodes, cost)) return false;
+          *cost += 2;
+          break;
+        case NULLOP: case RETURN: case LABEL: break;
+        case '&':
+          if (!tree->right) return false; /* address-taking, not bitwise AND */
+          ++*cost;
+          break;
+        case '/': case '%': *cost += 8; break;
+        case '*': *cost += tree->right ? 4 : 2; break;
+        default: ++*cost;
+        }
+    }
+  return cpu6InlineCost (tree->left, nodes, cost) && cpu6InlineCost (tree->right, nodes, cost);
+}
+
+static unsigned
+cpu6AutoInlineCost (symbol *func, ast *body)
+{
+#if !OPT_DISABLE_CPU6
+  unsigned nodes = 0, cost = 1, arguments = 0;
+  if (!TARGET_IS_CPU6 || cpu6_no_auto_inline || !body || !IS_FUNC (func->type) ||
+      IFFUNC_HASVARARGS (func->type) || IFFUNC_ISNAKED (func->type) ||
+      IFFUNC_ISISR (func->type) || IFFUNC_ISCRITICAL (func->type) ||
+      IFFUNC_ISBANKEDCALL (func->type) || IS_AGGREGATE (func->type->next)) return 0;
+  for (value *arg = FUNC_ARGS (func->type); arg; arg = arg->next)
+    if (++arguments > 4 || !arg->sym || IS_AGGREGATE (arg->type)) return 0;
+  cpu6CostFunction = func;
+  if (!cpu6InlineCost (body, &nodes, &cost)) return 0;
+  return cost <= (optimize.codeSize ? 8 : 32) ? cost : 0;
+#else
+  return 0;
+#endif
+}
+
+static bool
+cpu6InlineHasStatic (ast *tree)
+{
+  if (!tree) return false;
+  if (IS_AST_OP (tree) && tree->opval.op == BLOCK)
+    for (symbol *decl = tree->values.sym; decl; decl = decl->next)
+      if (IS_STATIC (decl->etype)) return true;
+  if (IS_AST_OP (tree) && tree->opval.op == FOR &&
+      (cpu6InlineHasStatic (AST_FOR (tree, initExpr)) ||
+       cpu6InlineHasStatic (AST_FOR (tree, condExpr)) ||
+       cpu6InlineHasStatic (AST_FOR (tree, loopExpr)))) return true;
+  return cpu6InlineHasStatic (tree->left) || cpu6InlineHasStatic (tree->right);
+}
+
+static void
+cpu6BindInlineInitializers (initList *list)
+{
+  for (; list; list = list->next)
+    if (list->type == INIT_NODE) cpu6BindInlineGlobals (list->init.node);
+    else if (list->type == INIT_DEEP) cpu6BindInlineInitializers (list->init.deep);
+}
+
+static void
+cpu6BindInlineGlobals (ast *tree)
+{
+  if (!tree) return;
+  if (IS_AST_OP (tree) && tree->opval.op == BLOCK)
+    {
+      for (symbol *decl = tree->values.sym; decl; decl = decl->next) decl->isinscope = 1;
+      for (symbol *decl = tree->values.sym; decl; decl = decl->next)
+        cpu6BindInlineInitializers (decl->ival);
+    }
+  if (IS_AST_VALUE (tree) && tree->opval.val->sym &&
+      !tree->opval.val->sym->implicit && !tree->opval.val->sym->islbl)
+    {
+      symbol *bound = findSymWithLevel (SymbolTab, tree->opval.val->sym);
+      if (bound && bound->etype && SPEC_ENUM (bound->etype) && IS_LITERAL (bound->etype))
+        tree->opval.val = valFromType (bound->type);
+      else if (bound && !bound->level)
+        {
+          symbol *copy = copySymbol (bound);
+          tree->opval.val->sym = copy;
+          tree->opval.val->type = copy->type;
+          tree->opval.val->etype = copy->etype;
+        }
+    }
+  if (IS_AST_OP (tree) && tree->opval.op == FOR)
+    {
+      cpu6BindInlineGlobals (AST_FOR (tree, initExpr));
+      cpu6BindInlineGlobals (AST_FOR (tree, condExpr));
+      cpu6BindInlineGlobals (AST_FOR (tree, loopExpr));
+    }
+  cpu6BindInlineGlobals (tree->left);
+  cpu6BindInlineGlobals (tree->right);
+  if (IS_AST_OP (tree) && tree->opval.op == BLOCK)
+    for (symbol *decl = tree->values.sym; decl; decl = decl->next) decl->isinscope = 0;
+}
+
 /*-----------------------------------------------------------------*/
 /* fixupInlineInDeclarators - recursively perform various fixups   */
 /*                            on an inline function tree           */
@@ -7676,8 +7859,11 @@ fixupInline (ast * tree, long level)
     {
       symbol *sym = tree->opval.val->sym;
 
-      sym->level = level;
-      sym->block = currBlockno;
+      if (!(TARGET_IS_CPU6 && !sym->level && !sym->islbl))
+        {
+          sym->level = level;
+          sym->block = currBlockno;
+        }
 
       sym->reqv = NULL;
       SYM_SPIL_LOC (sym) = NULL;
@@ -7826,6 +8012,13 @@ expandInlineFuncsInDeclarators (struct initList *ival, ast * block)
 static void
 expandInlineFuncs (ast * tree, ast * block)
 {
+  bool cpu6Pushed = false;
+  /* The call resolver must see enclosing local function-pointer declarations,
+     including those outside a nested block. Otherwise a same-named global
+     inline function can be selected instead. */
+  bool cpu6Block = TARGET_IS_CPU6 && IS_AST_OP (tree) && tree->opval.op == BLOCK;
+  if (cpu6Block)
+    for (symbol *decl = tree->values.sym; decl; decl = decl->next) decl->isinscope = 1;
   if (IS_AST_OP (tree) && (tree->opval.op == CALL) && tree->left && IS_AST_VALUE (tree->left) && tree->left->opval.val->sym)
     {
       int savedBlockno = currBlockno;
@@ -7842,9 +8035,18 @@ expandInlineFuncs (ast * tree, ast * block)
       if ((inCriticalFunction || inCriticalBlock) && IFFUNC_ISCRITICAL (func->type))
         werrorfl (tree->left->filename, tree->left->lineno, E_INVALID_CRITICAL);
 
-      /* Is this an inline function that we can inline? */
-      if (IFFUNC_ISINLINE (func->type) && !IFFUNC_HASVARARGS(func->type) && func->funcTree)
+      unsigned autoCost = cpu6AutoInlineCost (func, func->funcTree);
+      bool autoInline = autoCost && autoCost <= cpu6InlineBudget;
+      /* Explicit inline bypasses the growth budget, but must preserve local
+         static identity just like an ordinary call. */
+      if (!func->cpu6_mmu_page && (IFFUNC_ISINLINE (func->type) || autoInline) && !IFFUNC_HASVARARGS(func->type) && func->funcTree &&
+          !(TARGET_IS_CPU6 && (cpu6InlineHasStatic (func->funcTree) || cpu6InlineActive (func))))
         {
+          if (!IFFUNC_ISINLINE (func->type)) cpu6InlineBudget -= autoCost;
+          if (TARGET_IS_CPU6) {
+            cpu6InlineStack[cpu6InlineDepth++] = func;
+            cpu6Pushed = true;
+          }
           symbol *retsym = NULL;
           symbol *retlab;
           ast *inlinetree;
@@ -8017,6 +8219,9 @@ expandInlineFuncs (ast * tree, ast * block)
       if (tree->right)
         expandInlineFuncs (tree->right, block);
     }
+  if (cpu6Block)
+    for (symbol *decl = tree->values.sym; decl; decl = decl->next) decl->isinscope = 0;
+  if (cpu6Pushed) cpu6InlineDepth--;
 }
 
 /*------------------------------------------------------------*/
@@ -8138,12 +8343,17 @@ createFunction (symbol * name, ast * body)
     werrorfl (name->fileDef, name->lineDef, W_INLINE_NAKED, name->name);
 
   inlineState.count = 0;
+  cpu6InlineDepth = 0;
+  cpu6InlineBudget = optimize.codeSize ? 48 : 192;
   expandInlineFuncs (body, NULL);
 
   gatherImplicitVariables (body, NULL); /* move implicit variables into blocks */
 
-  if (FUNC_ISINLINE (name->type))
-    name->funcTree = copyAst (body);
+  if (FUNC_ISINLINE (name->type) || cpu6AutoInlineCost (name, body))
+    {
+      if (TARGET_IS_CPU6) cpu6BindInlineGlobals (body);
+      name->funcTree = copyAst (body);
+    }
 
   allocParms (FUNC_ARGS (name->type), name->type); // allocate the parameters
 
@@ -8161,7 +8371,15 @@ createFunction (symbol * name, ast * body)
   SNPRINTF (name->rname, sizeof (name->rname), "%s%s", port->fun_prefix, name->name);
 
   body = resolveSymbols (body); /* resolve the symbols */
+  if (TARGET_IS_CPU6) {
+    extern void cpu6MmuScan (ast *);
+    cpu6MmuScan (body);
+  }
   body = decorateType (body, RESULT_TYPE_NONE, true); /* propagateType & do semantic checks */
+  if (TARGET_IS_CPU6) {
+    extern void cpu6MmuScan (ast *);
+    cpu6MmuScan (body);
+  }
 
   /* save the stack information */
   if (options.useXstack)

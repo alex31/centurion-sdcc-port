@@ -60,6 +60,7 @@ int yyparse(void);
 extern int noLineno;
 char lbuff[1024];       /* local buffer */
 char function_name[256] = {0};
+extern void cpu6MmuAttribute (symbol *, attribute *);
 
 /* break & continue stacks */
 STACK_DCL(continueStack  ,symbol *,MAX_NEST_LEVEL)
@@ -112,6 +113,8 @@ bool uselessDecl = true;
 %token BITWISEAND UNARYMINUS IPUSH IPUSH_VALUE_AT_ADDRESS IPOP PCALL ENDFUNCTION JUMPTABLE
 %token ROT
 %token CAST CALL PARAM NULLOP BLOCK LABEL RECEIVE SEND ARRAYINIT
+%type <yyint> cpu6_mmu_value
+%type <attr> cpu6_mmu_attribute
 %token POINTER_NONNULL_CHECK
 %token DUMMY_READ_VOLATILE ENDCRITICAL INLINE RESTRICT SMALLC RAISONANCE IAR COSMIC DYNAMICC SDCCCALL PRESERVES_REGS Z88DK_FASTCALL Z88DK_CALLEE Z88DK_SHORTCALL Z88DK_PARAMS_OFFSET
 
@@ -333,6 +336,7 @@ unary_expression
            $$ = $2->left;
          else
            $$ = newNode ($1, $2, NULL);
+         if ($1 == '&' && IS_ADDRESS_OF_OP ($$)) $$->cpu6_user_address = 1;
        }
    | SIZEOF unary_expression        { $$ = newNode (SIZEOF, NULL, $2); }
    | SIZEOF '(' type_name ')'       { $$ = newAst_VALUE (sizeofOp ($3)); }
@@ -1082,7 +1086,11 @@ member_declarator_list
    ;
 
 member_declarator
-   : declarator
+   : declarator {
+       $$ = $1;
+       if ($1->cpu6_mmu_page)
+         werror (E_SYNTAX_ERROR, "mmu_page applies to a complete object, not a structure member");
+     }
    | ':' constant_expr
         {
           unsigned int bitsize;
@@ -1098,6 +1106,8 @@ member_declarator
    | declarator ':' constant_expr
         {
           unsigned int bitsize;
+          if ($1->cpu6_mmu_page)
+            werror (E_SYNTAX_ERROR, "mmu_page cannot annotate a bit-field");
           bitsize = (unsigned int) ulFromVal(constExprValue($3, true));
           if (floatFromVal (constExprValue($3, true)) < 0)
               werror (E_NEGATIVE_BITFLD_SIZE);
@@ -1361,10 +1371,11 @@ declarator
    ;
 
 direct_declarator
-   : identifier attribute_specifier_sequence_opt
+   : identifier attribute_specifier_sequence_opt { $$ = $1; cpu6MmuAttribute ($$, $2); }
    | '(' declarator ')'     { $$ = $2; }
-   | array_declarator attribute_specifier_sequence_opt
-   | declarator2_function_attributes attribute_specifier_sequence_opt
+   | array_declarator attribute_specifier_sequence_opt { $$ = $1; cpu6MmuAttribute ($$, $2); }
+   | declarator2_function_attributes attribute_specifier_sequence_opt { $$ = $1; cpu6MmuAttribute ($$, $2); }
+   | direct_declarator cpu6_mmu_attribute { $$ = $1; cpu6MmuAttribute ($$, $2); }
    ;
 
 declarator2
@@ -2133,6 +2144,31 @@ attribute_specifier
        if (!options.std_c23)
          werror(E_ATTRIBUTE_C23);
        $$ = $2;
+     }
+   ;
+
+cpu6_mmu_attribute
+   : identifier '(' '(' identifier '=' cpu6_mmu_value ')' ')'
+     {
+       /* Contextual spellings: outside a declaration both names remain
+          ordinary C identifiers, including calls with parenthesized assigns. */
+       if (!TARGET_IS_CPU6 ||
+           (strcmp ($1->name, "attribute") && strcmp ($1->name, "__attribute__")) ||
+           strcmp ($4->name, "mmu_page"))
+         werror (E_SYNTAX_ERROR, "expected CPU6 attribute((mmu_page=auto|0..9))");
+       $$ = newAttribute ($4, 0);
+       SNPRINTF ($$->argument_clause, sizeof ($$->argument_clause), "%d", $6);
+     }
+   ;
+
+cpu6_mmu_value
+   : AUTO { $$ = -1; }
+   | constant_expr
+     {
+       value *v = constExprValue ($1, true);
+       if (!v || !IS_INTEGRAL (v->type) || ulFromVal (v) > 9)
+         { werror (E_SYNTAX_ERROR, "mmu_page requires auto or a page number in 0..9"); $$ = -1; }
+       else $$ = (int)ulFromVal (v) + 1;
      }
    ;
 

@@ -719,6 +719,7 @@ AC_SUBST(SVN_REVISION)
 rm -f ports.all ports.build
 
 # Supported targets
+AC_DO_PORT(cpu6, cpu6, CPU6, [Excludes the Centurion CPU6 port])
 AC_DO_PORT(mcs51,    mcs51,  MCS51,    [Excludes the Intel mcs51 port])
 AC_DO_PORT(z80,      z80,    Z80,      [Excludes the Z80 port])
 AC_DO_PORT(z180,     z80,    Z180,     [Excludes the Z180 port])
@@ -882,6 +883,10 @@ fi
 if test $OPT_DISABLE_SM83 = 0; then
   AC_CONFIG_FILES([sdas/asgb/Makefile])
   test $OPT_DISABLE_DEVICE_LIB = 0 && AC_CONFIG_FILES([device/lib/sm83/Makefile])
+fi
+
+if test $OPT_DISABLE_CPU6 = 0; then
+  AC_CONFIG_FILES([src/cpu6/Makefile])
 fi
 
 if test $OPT_DISABLE_STM8 = 0; then

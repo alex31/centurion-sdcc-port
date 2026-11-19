@@ -71,8 +71,14 @@ cnvToFcall (iCode * ic, eBBlock * ebp)
   left = IC_LEFT (ic);
   right = IC_RIGHT (ic);
 
-  if (IS_FLOAT (operandType (right)))
+  if (IS_FLOAT (operandType (right)) || (TARGET_IS_CPU6 && IS_FLOAT (operandType (left))))
     {
+      if (TARGET_IS_CPU6) {
+        if (IS_VALOP (left)) left = operandFromValue (valCastLiteral (floatType, operandLitValue (left), 0), false);
+        if (IS_VALOP (right)) right = operandFromValue (valCastLiteral (floatType, operandLitValue (right), 0), false);
+        IC_LEFT (ic) = left;
+        IC_RIGHT (ic) = right;
+      }
       switch (ic->op)
         {
         case '+':
@@ -96,6 +102,17 @@ cnvToFcall (iCode * ic, eBBlock * ebp)
         case '<':
           func = fslt;
           break;
+        case LE_OP:
+          func = fsle;
+          break;
+        case GE_OP:
+          {
+            operand *tmp = right;
+            right = left;
+            left = tmp;
+            func = fsle;
+            break;
+          }
         case '>':
           {
             operand *tmp = right;
@@ -312,11 +329,23 @@ appendCast (iCode *ic, sym_link *type, eBBlock *ebb)
 static void
 cnvToFloatCast (iCode *ic, eBBlock *ebp)
 {
+  if (TARGET_IS_CPU6 && getSize (operandType (ic->right)) > 4)
+    {
+      werrorfl (ic->filename, ic->lineno, E_SYNTAX_ERROR, "CPU6 float32 conversions support only 8/16/32-bit integers");
+      return;
+    }
   iCode *ip, *newic;
   symbol *func = NULL;
   int linenno = ic->lineno;
   int bwd, su;
   int bytesPushed=0;
+
+  if (TARGET_IS_CPU6 && IS_BOOL (operandType (ic->right)))
+    {
+      sym_link *byte = newCharLink ();
+      SPEC_USIGN (byte) = 1;
+      prependCast (ic, ic->right, byte, ebp);
+    }
 
   // Use basic type cast function for _BitInt
   if (IS_BITINT (operandType (ic->right)))
@@ -553,6 +582,13 @@ found:
 static void
 cnvFromFloatCast (iCode * ic, eBBlock * ebp)
 {
+  if (TARGET_IS_CPU6 && getSize (operandType (ic->left)) > 4)
+    {
+      werrorfl (ic->filename, ic->lineno, E_SYNTAX_ERROR, "CPU6 float32 conversions support only 8/16/32-bit integers");
+      return;
+    }
+  if (TARGET_IS_CPU6 && (IS_BOOL (operandType (ic->left)) || IS_FLOAT (operandType (ic->left))))
+    return; /* CPU6 emits a sign-masked magnitude test, not integer truncation. */
   iCode *ip, *newic;
   symbol *func = NULL;
   const char *filename = ic->filename;
@@ -1372,8 +1408,9 @@ convertToFcall (eBBlock ** ebbs, int count)
         {
           /* floating point operations are
              converted to function calls */
-          if ((IS_CONDITIONAL (ic) || IS_ARITHMETIC_OP (ic)) &&
-              (IS_FLOAT (operandType (IC_RIGHT (ic))) || IS_FIXED( operandType (IC_RIGHT (ic)))))
+          if ((IS_CONDITIONAL (ic) || IS_ARITHMETIC_OP (ic)) && ic->right &&
+              (IS_FLOAT (operandType (IC_RIGHT (ic))) || IS_FIXED( operandType (IC_RIGHT (ic))) ||
+               (TARGET_IS_CPU6 && IS_FLOAT (operandType (IC_LEFT (ic))))))
             {
               cnvToFcall (ic, ebbs[i]);
             }

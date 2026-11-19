@@ -462,6 +462,15 @@ initValPointer (ast *expr)
       return valForCastAggr (expr->left->right->left, expr->left->left->opval.lnk, expr->right, expr->opval.op);
     }
 
+  /* CPU6 has one flat pointer space. A cast array base plus a constant
+     offset is also a relocatable address, with the cast's element size. */
+  if (TARGET_IS_CPU6 && IS_AST_OP (expr) &&
+      (expr->opval.op == '+' || expr->opval.op == '-') &&
+      IS_CAST_OP (expr->left) && IS_PTR (expr->left->ftype) &&
+      IS_AST_SYM_VALUE (expr->left->right) && IS_ARRAY (expr->left->right->ftype) &&
+      IS_AST_LIT_VALUE (expr->right))
+    return valForCastAggr (expr->left->right, expr->left->ftype, expr->right, expr->opval.op);
+
   /* case 4. (array type) */
   if (IS_AST_SYM_VALUE (expr) && IS_ARRAY (expr->ftype))
     {

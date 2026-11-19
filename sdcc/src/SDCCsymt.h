@@ -311,6 +311,7 @@ typedef struct symbol
 {
   char name[SDCC_SYMNAME_MAX + 1];  /* Input Variable Name     */
   char rname[SDCC_NAME_MAX + 1];    /* internal name           */
+  int cpu6_mmu_page;              /* 0 ordinary; -1 auto; 1..10 pinned logical page+1 */
 
   long level;                       /* declaration lev,fld offset */
   int block;                        /* sequential block # of definition */
@@ -653,6 +654,7 @@ extern symbol *fsdiv;
 extern symbol *fseq;
 extern symbol *fsneq;
 extern symbol *fslt;
+extern symbol *fsle;
 
 extern symbol *sdcc_atomic_load;
 extern symbol *sdcc_atomic_store;

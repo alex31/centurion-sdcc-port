@@ -86,6 +86,32 @@ int lexLineno = 1;
 /* local definitions */
 static struct dbuf_s asmbuff; /* reusable _asm buffer */
 
+static void cpu6_float_token (const char *text, bool is_double)
+{
+#if !OPT_DISABLE_CPU6
+  extern int cpu6_float32;
+  if (!TARGET_IS_CPU6) return;
+  if (is_double)
+    werror (E_SYNTAX_ERROR, "CPU6 supports float32 only, not double or long double");
+  else if (!cpu6_float32)
+    werror (E_SYNTAX_ERROR, "CPU6 floating point requires --cpu6-float32 (wrapper: --float32)");
+  else if (text && strcmp (text, "float")) {
+    char *suffix;
+    (void)strtod (text, &suffix);
+    if ((suffix[0] != 'f' && suffix[0] != 'F') || suffix[1])
+      werror (E_SYNTAX_ERROR, "CPU6 float32 constants require an f suffix; double literals are unsupported");
+  }
+#endif
+}
+
+static value *cpu6_float_literal (const char *text)
+{
+  cpu6_float_token (text, false);
+  value *result = constFloatVal (text);
+  if (TARGET_IS_CPU6) SPEC_CVAL (result->etype).v_float = strtof (text, NULL);
+  return result;
+}
+
 /* forward declarations */
 int yyerror (char *s);
 static const char *stringLiteral (char);
@@ -135,11 +161,11 @@ static void checkCurrFile (const char *s);
 "continue"              { count (); return CONTINUE; }
 "default"               { count (); return DEFAULT; }
 "do"                    { count (); return DO; }
-"double"                { count (); return DOUBLE; }
+"double"                { count (); cpu6_float_token (yytext, true); return DOUBLE; }
 "else"                  { count (); return ELSE; }
 "enum"                  { count (); return ENUM; }
 "extern"                { count (); return EXTERN; }
-"float"                 { count (); return SD_FLOAT; }
+"float"                 { count (); cpu6_float_token (yytext, false); return SD_FLOAT; }
 "for"                   { count (); return FOR; }
 "goto"                  { count (); return GOTO; }
 "if"                    { count (); return IF; }
@@ -271,12 +297,12 @@ static void checkCurrFile (const char *s);
 0([oO]{O})?{OC}*({IS}|{WB})? { count (); yylval.val = constIntVal (yytext); return CONSTANT; }
 0[bB]{B}{BC}*({IS}|{WB})?    { count (); yylval.val = constIntVal (yytext); return CONSTANT; } /* C23 binary integer constant. All standard version warnings on integer constants are done in constIntVal. */
 {CP}?'(\\.|[^\\'])+'         { count (); yylval.val = charVal (yytext); return CONSTANT; /* ' make syntax highlighter happy */ }
-{D}+{E}{FS}?                 { count (); yylval.val = constFloatVal (yytext); return CONSTANT; }
-{D}*"."{D}+({E})?{FS}?       { count (); yylval.val = constFloatVal (yytext); return CONSTANT; }
-{D}+"."{D}*({E})?{FS}?       { count (); yylval.val = constFloatVal (yytext); return CONSTANT; }
-0[xX]{H}+{BE}{FS}?           { count (); if (!options.std_c99) werror(E_HEXFLOAT_C99); yylval.val = constFloatVal (yytext); return CONSTANT; }
-0[xX]{H}*"."{H}+({BE})?{FS}? { count (); if (!options.std_c99) werror(E_HEXFLOAT_C99); yylval.val = constFloatVal (yytext); return CONSTANT; }
-0[xX]{H}+"."{H}*({BE})?{FS}? { count (); if (!options.std_c99) werror(E_HEXFLOAT_C99); yylval.val = constFloatVal (yytext); return CONSTANT; }
+{D}+{E}{FS}?                 { count (); yylval.val = cpu6_float_literal (yytext); return CONSTANT; }
+{D}*"."{D}+({E})?{FS}?       { count (); yylval.val = cpu6_float_literal (yytext); return CONSTANT; }
+{D}+"."{D}*({E})?{FS}?       { count (); yylval.val = cpu6_float_literal (yytext); return CONSTANT; }
+0[xX]{H}+{BE}{FS}?           { count (); if (!options.std_c99) werror(E_HEXFLOAT_C99); yylval.val = cpu6_float_literal (yytext); return CONSTANT; }
+0[xX]{H}*"."{H}+({BE})?{FS}? { count (); if (!options.std_c99) werror(E_HEXFLOAT_C99); yylval.val = cpu6_float_literal (yytext); return CONSTANT; }
+0[xX]{H}+"."{H}*({BE})?{FS}? { count (); if (!options.std_c99) werror(E_HEXFLOAT_C99); yylval.val = cpu6_float_literal (yytext); return CONSTANT; }
 \"                           { count (); yylval.yystr = stringLiteral (0); return STRING_LITERAL; }
 "L\""                        { count (); if (!options.std_c95) werror(E_WCHAR_STRING_C95); yylval.yystr = stringLiteral ('L'); return STRING_LITERAL; }
 "u8\""                       { count (); if (!options.std_c11) werror(E_U8CHAR_STRING_C11); yylval.yystr = stringLiteral ('8'); return STRING_LITERAL; }

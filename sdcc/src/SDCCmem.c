@@ -683,7 +683,7 @@ allocParms (value *val, struct sym_link *ftype)
           int paramsize = getSize (lval->type) +
             (getSize (lval->type) == 1 && (smallc || dynamicc && !IS_STRUCT (lval->type))) +
             (getSize (lval->type) == 3 && dynamicc && IS_FARPTR (lval->type)) +
-            (getSize (lval->type) % 2 && TARGET_PDK_LIKE);
+            (getSize (lval->type) % 2 && (TARGET_PDK_LIKE || TARGET_IS_CPU6));
 
           if (lval->sym)
             lval->sym->onStack = 1;

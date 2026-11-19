@@ -376,6 +376,9 @@ static PORT *_ports[] = {
 #if !OPT_DISABLE_S08
   &s08_port,
 #endif
+#if !OPT_DISABLE_CPU6
+  &cpu6_port,
+#endif
 #if !OPT_DISABLE_STM8
   &stm8_port,
 #endif

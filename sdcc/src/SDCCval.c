@@ -1210,11 +1210,34 @@ checkConstantRange (sym_link * var, sym_link * lit, int op, bool exchangeLeftRig
 /*-----------------------------------------------------------------*/
 /* valueFromLit - creates a value from a literal                   */
 /*-----------------------------------------------------------------*/
+static double cpu6FloatRound (double value)
+{
+#if !OPT_DISABLE_CPU6
+  extern int cpu6_float32;
+  return TARGET_IS_CPU6 && cpu6_float32 ? (double)(float)value : value;
+#else
+  return value;
+#endif
+}
+
 value *
 valueFromLit (double lit)
 {
   struct dbuf_s dbuf;
   value *ret;
+
+  /* The old fallback represents unsigned word-pair constants as float.
+     CPU6 now supports actual float operands, so keep integer constants typed
+     as integers. This also avoids an out-of-range host signed conversion. */
+  if (TARGET_IS_CPU6 && lit > 2147483647.0 && lit <= 4294967295.0 &&
+      (double)(TYPE_TARGET_ULONG)lit == lit)
+    {
+      dbuf_init (&dbuf, 128);
+      dbuf_printf (&dbuf, "%.0fUL", lit);
+      ret = constVal (dbuf_c_str (&dbuf));
+      dbuf_destroy (&dbuf);
+      return ret;
+    }
 
   if ((((TYPE_TARGET_LONG) lit) - lit) == 0)
     {
@@ -2491,7 +2514,7 @@ valUnaryPM (value * val, bool reduceType)
 {
   /* depending on type */
   if (SPEC_NOUN (val->etype) == V_FLOAT)
-    SPEC_CVAL (val->etype).v_float = -1.0 * SPEC_CVAL (val->etype).v_float;
+    SPEC_CVAL (val->etype).v_float = cpu6FloatRound (-1.0 * SPEC_CVAL (val->etype).v_float);
   else if (SPEC_NOUN (val->etype) == V_FIXED16X16)
     SPEC_CVAL (val->etype).v_fixed16x16 = (TYPE_TARGET_ULONG) - ((long) SPEC_CVAL (val->etype).v_fixed16x16);
   else if (SPEC_LONGLONG (val->etype) || SPEC_NOUN (val->etype) == V_BITINT)
@@ -2633,7 +2656,7 @@ valMult (value * lval, value * rval, bool reduceType)
   SPEC_SCLS (val->etype) = S_LITERAL;   /* will remain literal */
 
   if (IS_FLOAT (val->type))
-    SPEC_CVAL (val->type).v_float = floatFromVal (lval) * floatFromVal (rval);
+    SPEC_CVAL (val->type).v_float = cpu6FloatRound (floatFromVal (lval) * floatFromVal (rval));
   else if (IS_FIXED16X16 (val->type))
     SPEC_CVAL (val->type).v_fixed16x16 = fixed16x16FromDouble (floatFromVal (lval) * floatFromVal (rval));
   /* signed and unsigned mul are the same, as long as the precision of the
@@ -2724,7 +2747,7 @@ valDiv (value * lval, value * rval, bool reduceType)
 
 
   if (IS_FLOAT (val->type))
-    SPEC_CVAL (val->type).v_float = floatFromVal (lval) / floatFromVal (rval);
+    SPEC_CVAL (val->type).v_float = cpu6FloatRound (floatFromVal (lval) / floatFromVal (rval));
   else if (IS_FIXED16X16 (val->type))
     SPEC_CVAL (val->type).v_fixed16x16 = fixed16x16FromDouble (floatFromVal (lval) / floatFromVal (rval));
   else if (SPEC_LONGLONG (val->type) || IS_BITINT (val->type))
@@ -2881,7 +2904,7 @@ valPlus (value * lval, value * rval, bool reduceType)
   if (!IS_SPEC (val->type))
     SPEC_CVAL (val->etype).v_ulong = (TYPE_TARGET_ULONG) ulFromVal (lval) + (TYPE_TARGET_ULONG) ulFromVal (rval);
   else if (IS_FLOAT (val->type))
-    SPEC_CVAL (val->type).v_float = floatFromVal (lval) + floatFromVal (rval);
+    SPEC_CVAL (val->type).v_float = cpu6FloatRound (floatFromVal (lval) + floatFromVal (rval));
   else if (IS_FIXED16X16 (val->type))
     SPEC_CVAL (val->type).v_fixed16x16 = fixed16x16FromDouble (floatFromVal (lval) + floatFromVal (rval));
   else if (SPEC_LONGLONG (val->type) || IS_BITINT (val->type))
@@ -2929,7 +2952,7 @@ valMinus (value * lval, value * rval, bool reduceType)
   if (!IS_SPEC (val->type))
     SPEC_CVAL (val->etype).v_ulong = (TYPE_TARGET_ULONG) ulFromVal (lval) - (TYPE_TARGET_ULONG) ulFromVal (rval);
   else if (IS_FLOAT (val->type))
-    SPEC_CVAL (val->type).v_float = floatFromVal (lval) - floatFromVal (rval);
+    SPEC_CVAL (val->type).v_float = cpu6FloatRound (floatFromVal (lval) - floatFromVal (rval));
   else if (IS_FIXED16X16 (val->type))
     SPEC_CVAL (val->type).v_fixed16x16 = fixed16x16FromDouble (floatFromVal (lval) - floatFromVal (rval));
   else if (SPEC_LONGLONG (val->type) || IS_BITINT (val->type))
@@ -3294,7 +3317,7 @@ valCastLiteral (sym_link *dtype, double fval, TYPE_TARGET_ULONGLONG llval)
   switch (SPEC_NOUN (val->etype))
     {
     case V_FLOAT:
-      SPEC_CVAL (val->etype).v_float = fval;
+      SPEC_CVAL (val->etype).v_float = cpu6FloatRound (fval);
       break;
 
     case V_FIXED16X16:
@@ -3410,7 +3433,7 @@ valRecastLitVal (sym_link * dtype, value * val)
   switch (SPEC_NOUN (val->etype))
     {
     case V_FLOAT:
-      SPEC_CVAL (val->etype).v_float = fval;
+      SPEC_CVAL (val->etype).v_float = cpu6FloatRound (fval);
       break;
 
     case V_FIXED16X16:
@@ -3572,12 +3595,12 @@ valForArray (ast * arrExpr)
     }
   else if (lval)
     {
-      SNPRINTF (val->name, sizeof (val->name), "(%s + %d)", lval->name, AST_ULONG_VALUE (arrExpr->right) * size);
+      SNPRINTF (val->name, sizeof (val->name), TARGET_IS_CPU6 ? "%s + %d" : "(%s + %d)", lval->name, AST_ULONG_VALUE (arrExpr->right) * size);
       memcpy (val->type, lval->type, sizeof (sym_link));
     }
   else
     {
-      SNPRINTF (val->name, sizeof (val->name), "(%s + %d)",
+      SNPRINTF (val->name, sizeof (val->name), TARGET_IS_CPU6 ? "%s + %d" : "(%s + %d)",
                 AST_SYMBOL (arrExpr->left)->rname, AST_ULONG_VALUE (arrExpr->right) * size);
       if (SPEC_SCLS (arrExpr->left->etype) == S_CODE)
         DCL_TYPE (val->type) = CPOINTER;
@@ -3672,15 +3695,15 @@ valForStructElem (ast * structT, ast * elemT)
     }
   else if (lval)
     {
-      SNPRINTF (val->name, sizeof (val->name), "(%s + %d)", lval->name, (int) sym->offset);
+      SNPRINTF (val->name, sizeof (val->name), TARGET_IS_CPU6 ? "%s + %d" : "(%s + %d)", lval->name, (int) sym->offset);
       memcpy (val->type, lval->type, sizeof (sym_link));
     }
   else
     {
       if (sast)
-        SNPRINTF (val->name, sizeof (val->name), "(%s + (%d))", AST_SYMBOL (sast)->rname, ((int) sym->offset) + idxoff);
+        SNPRINTF (val->name, sizeof (val->name), TARGET_IS_CPU6 ? "%s + %d" : "(%s + (%d))", AST_SYMBOL (sast)->rname, ((int) sym->offset) + idxoff);
       else
-        SNPRINTF (val->name, sizeof (val->name), "(%s + %d)", AST_SYMBOL (structT)->rname, (int) sym->offset);
+        SNPRINTF (val->name, sizeof (val->name), TARGET_IS_CPU6 ? "%s + %d" : "(%s + %d)", AST_SYMBOL (structT)->rname, (int) sym->offset);
 
       if (SPEC_SCLS (structT->etype) == S_CODE)
         DCL_TYPE (val->type) = CPOINTER;
@@ -3717,7 +3740,9 @@ valForCastAggr (ast * aexpr, sym_link * type, ast * cnst, int op)
 
   val = newValue ();
 
-  SNPRINTF (val->name, sizeof (val->name), "(%s %c %d)",
+  /* These pointer expressions contain only a symbol and folded byte offsets.
+     as-ee200 treats parentheses as addressing syntax, not expression groups. */
+  SNPRINTF (val->name, sizeof (val->name), TARGET_IS_CPU6 ? "%s %c %d" : "(%s %c %d)",
             AST_SYMBOL (aexpr)->rname, op, getSize (type->next) * AST_ULONG_VALUE (cnst));
 
   val->type = type;
@@ -3739,7 +3764,7 @@ valForCastArr (ast * aexpr, sym_link * type)
 
   val = newValue ();
 
-  SNPRINTF (val->name, sizeof (val->name), "(%s)", AST_SYMBOL (aexpr)->rname);
+  SNPRINTF (val->name, sizeof (val->name), TARGET_IS_CPU6 ? "%s" : "(%s)", AST_SYMBOL (aexpr)->rname);
 
   val->type = type;
   val->etype = getSpec (val->type);

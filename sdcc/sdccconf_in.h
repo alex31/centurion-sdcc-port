@@ -113,6 +113,9 @@
 #undef NON_FREE_LIB_DIR_SUFFIX
 
 /* XXX */
+#undef OPT_DISABLE_CPU6
+
+/* XXX */
 #undef OPT_DISABLE_DEVICE_LIB
 
 /* XXX */

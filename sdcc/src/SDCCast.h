@@ -51,6 +51,7 @@ typedef struct ast
   unsigned initMode:1;
   unsigned reversed:1;
   unsigned inlined:1;
+  unsigned cpu6_user_address:1;  /* Explicit source &, not an internal member/index address. */
   long level;                   /* level for expr */
   int block;                    /* block number   */
   int seqPoint;                 /* sequence point */

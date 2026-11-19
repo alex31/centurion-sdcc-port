@@ -688,6 +688,7 @@ OPT_DISABLE_R2K
 OPT_DISABLE_Z180
 OPT_DISABLE_Z80
 OPT_DISABLE_MCS51
+OPT_DISABLE_CPU6
 SVN_REVISION
 GIT_REVISION
 non_free_lib_dir_suffix
@@ -794,6 +795,7 @@ with_python_sys_prefix
 with_python_prefix
 with_python_exec_prefix
 with_ccache
+enable_cpu6_port
 enable_mcs51_port
 enable_z80_port
 enable_z180_port
@@ -1489,6 +1491,7 @@ Optional Features:
   --disable-option-checking  ignore unrecognized --enable/--with options
   --disable-FEATURE       do not include FEATURE (same as --enable-FEATURE=no)
   --enable-FEATURE[=ARG]  include FEATURE [ARG=yes]
+  --disable-cpu6-port     Excludes the Centurion CPU6 port
   --disable-mcs51-port    Excludes the Intel mcs51 port
   --disable-z80-port      Excludes the Z80 port
   --disable-z180-port     Excludes the Z180 port
@@ -7232,6 +7235,31 @@ rm -f ports.all ports.build
 
 # Supported targets
 
+  # Check whether --enable-cpu6-port was given.
+if test ${enable_cpu6_port+y}
+then :
+  enableval=$enable_cpu6_port;
+fi
+
+
+  if test "$enable_cpu6_port" = "no"; then
+    OPT_DISABLE_CPU6=1
+  else
+    enable_cpu6_port="yes"
+    OPT_DISABLE_CPU6=0
+  fi
+
+
+printf "%s\n" "#define OPT_DISABLE_CPU6 $OPT_DISABLE_CPU6" >>confdefs.h
+
+
+
+  echo cpu6 >>ports.all
+  if test $OPT_DISABLE_CPU6 = 0; then
+    echo cpu6 >>ports.build
+  fi
+
+
   # Check whether --enable-mcs51-port was given.
 if test ${enable_mcs51_port+y}
 then :
@@ -8624,6 +8652,11 @@ if test $OPT_DISABLE_SM83 = 0; then
 
 fi
 
+if test $OPT_DISABLE_CPU6 = 0; then
+  ac_config_files="$ac_config_files src/cpu6/Makefile"
+
+fi
+
 if test $OPT_DISABLE_STM8 = 0; then
   ac_config_files="$ac_config_files src/stm8/Makefile sdas/asstm8/Makefile"
 
@@ -9435,6 +9468,7 @@ do
     "device/lib/tlcs90/Makefile") CONFIG_FILES="$CONFIG_FILES device/lib/tlcs90/Makefile" ;;
     "sdas/asgb/Makefile") CONFIG_FILES="$CONFIG_FILES sdas/asgb/Makefile" ;;
     "device/lib/sm83/Makefile") CONFIG_FILES="$CONFIG_FILES device/lib/sm83/Makefile" ;;
+    "src/cpu6/Makefile") CONFIG_FILES="$CONFIG_FILES src/cpu6/Makefile" ;;
     "src/stm8/Makefile") CONFIG_FILES="$CONFIG_FILES src/stm8/Makefile" ;;
     "sdas/asstm8/Makefile") CONFIG_FILES="$CONFIG_FILES sdas/asstm8/Makefile" ;;
     "device/lib/stm8/Makefile") CONFIG_FILES="$CONFIG_FILES device/lib/stm8/Makefile" ;;

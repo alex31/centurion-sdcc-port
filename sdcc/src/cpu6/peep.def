@@ -1,0 +1,510 @@
+// CPU6 rules use the Fuzix EE200 syntax. Conditions account for word flags,
+// address updates, volatile accesses and the 8-bit relative branch range.
+
+replace restart {
+    jmp %1
+} by {
+    bra %1
+} if labelInRange(%1)
+
+replace restart {
+    jmp %1
+%1:
+} by {
+%1:
+}
+
+replace restart {
+    bra %1
+%1:
+} by {
+%1:
+}
+
+replace restart {
+    bz %1
+    jmp %2
+%1:
+} by {
+    bnz %2
+%1:
+} if labelInRange(%2)
+
+replace restart {
+    bnz %1
+    jmp %2
+%1:
+} by {
+    bz %2
+%1:
+} if labelInRange(%2)
+
+replace restart {
+    bm %1
+    jmp %2
+%1:
+} by {
+    bp %2
+%1:
+} if labelInRange(%2)
+
+replace restart {
+    bp %1
+    jmp %2
+%1:
+} by {
+    bm %2
+%1:
+} if labelInRange(%2)
+
+replace restart {
+    bl %1
+    jmp %2
+%1:
+} by {
+    bnl %2
+%1:
+} if labelInRange(%2)
+
+replace restart {
+    bnl %1
+    jmp %2
+%1:
+} by {
+    bl %2
+%1:
+} if labelInRange(%2)
+
+replace restart {
+    xfr %1,%2
+    xfr %2,%1
+} by {
+    xfr %1,%2
+} if canAssign(%1 %2)
+
+replace restart {
+    xfr %1,b
+    inr b
+    xfr b,%1
+} by {
+    inr %1
+    xfr %1,b
+} if canAssign('b' %1)
+
+replace restart {
+    xfr %1,b
+    dcr b
+    xfr b,%1
+} by {
+    dcr %1
+    xfr %1,b
+} if canAssign('b' %1)
+
+replace restart {
+    xfr %1,%1
+} by {
+} if canAssign(%1 %1), notUsed('nf' 'zf')
+
+replace restart {
+    xfr %1,%2
+} by {
+} if canAssign(%1 %2), same(%2 'x' 'y' 'z'), notUsed(%2 'nf' 'zf')
+
+replace restart {
+    xfr %1,b
+    inr b,%2
+    xfr b,%1
+} by {
+    inr %1,%2
+    xfr %1,b
+} if canAssign('b' %1)
+
+replace restart {
+    xfr %1,b
+    dcr b,%2
+    xfr b,%1
+} by {
+    dcr %1,%2
+    xfr %1,b
+} if canAssign('b' %1)
+
+replace restart {
+    stb %1
+    ldb %1
+} by {
+    stb %1
+} if notVolatile(%1), canAssign('b' %1 'stable-memory')
+
+replace restart {
+    sta %1
+    lda %1
+} by {
+    sta %1
+} if notVolatile(%1), canAssign('a' %1 'stable-memory')
+
+replace restart {
+    stx %1
+    ldx %1
+} by {
+    stx %1
+} if notVolatile(%1), canAssign('x' %1 'stable-memory')
+
+replace restart {
+    stbb %1
+    ldbb %1
+} by {
+    stbb %1
+} if notVolatile(%1), canAssign('b' %1 'stable-memory')
+
+replace restart {
+    stab %1
+    ldab %1
+} by {
+    stab %1
+} if notVolatile(%1), canAssign('a' %1 'stable-memory')
+
+replace restart {
+    sta %1
+    ldb %1
+} by {
+    sta %1
+    xfr a,b
+} if notVolatile(%1), canAssign('a' %1 'stable-memory')
+
+replace restart {
+    stb %1
+    lda %1
+} by {
+    stb %1
+    xfr b,a
+} if notVolatile(%1), canAssign('b' %1 'stable-memory')
+
+replace restart {
+    stx (-s)
+    ldx (s+)
+} by {
+} if notUsed('nf' 'zf')
+
+replace restart {
+    stb (-s)
+    ldb (s+)
+} by {
+} if notUsed('nf' 'zf')
+
+replace restart {
+    sta (-s)
+    lda (s+)
+} by {
+} if notUsed('nf' 'zf')
+
+replace restart {
+    sta (-s)
+    ldb (s+)
+} by {
+    xfr a,b
+}
+
+replace restart {
+    stb (-s)
+    lda (s+)
+} by {
+    xfr b,a
+}
+
+replace restart {
+    lda %1
+    xfr a,b
+} by {
+    ldb %1
+} if notUsed('a'), canAssign('a' %1 'stable-load')
+
+replace restart {
+    lda %1
+    xfr a,x
+} by {
+    ldx %1
+} if notUsed('a'), canAssign('a' %1 'stable-load')
+
+replace restart {
+    ldb %1
+    xfr b,a
+} by {
+    lda %1
+} if notUsed('b'), canAssign('b' %1 'stable-load')
+
+replace restart {
+    ldb %1
+    xfr b,x
+} by {
+    ldx %1
+} if notUsed('b'), canAssign('b' %1 'stable-load')
+
+replace restart {
+    xfr a,b
+    stb %1
+} by {
+    sta %1
+} if notUsed('b'), canAssign('b' %1 'independent-address')
+
+replace restart {
+    xfr b,a
+    sta %1
+} by {
+    stb %1
+} if notUsed('a'), canAssign('a' %1 'independent-address')
+
+// CLR clears F and L; an ordinary load preserves them.
+replace restart {
+    lda 0
+} by {
+    cla
+} if notUsed('cf' 'of')
+
+replace restart {
+    ldb 0
+} by {
+    clr b
+} if notUsed('cf' 'of')
+
+replace restart {
+    ldx 0
+} by {
+    clr x
+} if notUsed('cf' 'of')
+
+replace restart {
+    lda 1
+    aab
+} by {
+    inr b
+} if notUsed('a' 'cf' 'of')
+
+replace restart {
+    lda 2
+    aab
+} by {
+    inr b
+    inr b
+} if notUsed('a' 'cf' 'of')
+
+replace restart {
+    lda 1
+    sub b,a
+    xab
+} by {
+    dcr b
+} if notUsed('a' 'cf' 'of')
+
+replace restart {
+    lda 0
+    aab
+} by {
+} if notUsed('a' 'nf' 'zf' 'cf' 'of')
+
+// These instructions have already set N/Z from the same full word in B.
+replace restart {
+    %1
+    ori b,b
+} by {
+    %1
+} if same(%1 'aab' 'sab' 'nab' 'inr b' 'dcr b' 'slr b' 'srr b' 'rrr b' 'rlr b' 'ori a,b' 'ore a,b')
+
+replace restart {
+    ldb %1
+    ori b,b
+} by {
+    ldb %1
+}
+
+replace restart {
+    xfr %1,b
+    ori b,b
+} by {
+    xfr %1,b
+} if canAssign('b' %1)
+
+replace restart {
+    lda %1
+    lda %2
+} by {
+    lda %2
+} if notVolatile(%1), canAssign('a' %1 'stable-load'), canAssign('a' %2 'independent-address')
+
+replace restart {
+    ldb %1
+    ldb %2
+} by {
+    ldb %2
+} if notVolatile(%1), canAssign('b' %1 'stable-load'), canAssign('b' %2 'independent-address')
+
+// Auto-indexing rules. Generic mnemonic captures are constrained by the
+// CPU6 predicate to exact byte/word load/store opcodes and disjoint aliases.
+// Every fused update requires all four flags dead and a nonvolatile window.
+
+// Discard a high-byte clear only if neither BH nor any changed flag survives.
+replace restart {
+    clrb bh
+} by {
+} if canAssign('bl' 'al' 'byte-arithmetic'), notUsed('bh' 'nf' 'zf' 'cf' 'of')
+
+replace restart {
+    %1 al,bl
+    orib bl,bl
+} by {
+    %1 al,bl
+} if canAssign('bl' 'al' 'byte-arithmetic'), same(%1 'addb' 'subb' 'andb' 'orib' 'oreb')
+
+replace restart {
+    ldbb %1
+    orib bl,bl
+} by {
+    ldbb %1
+} if canAssign('bl' 'al' 'byte-arithmetic')
+
+replace restart {
+    xfr %1,b
+    inr b
+    inr b
+    xfr b,%1
+} by {
+    inr %1
+    inr %1
+    xfr %1,b
+} if canAssign('b' %1 'autoindex-base')
+
+replace restart {
+    xfr %1,b
+    dcr b
+    dcr b
+    xfr b,%1
+} by {
+    dcr %1
+    dcr %1
+    xfr %1,b
+} if canAssign('b' %1 'autoindex-base')
+
+// Discard a pointer copy only when the following load overwrites it.
+replace restart {
+    xfr %1,b
+    ldb %2
+} by {
+    ldb %2
+} if canAssign('b' %1 'autoindex-base'), canAssign('b' %2 'independent-address')
+
+replace restart {
+    xfr %1,b
+    ldbb %2
+} by {
+    ldbb %2
+} if canAssign('b' %1 'autoindex-base'), canAssign('b' %2 'independent-address'), notUsed('bh')
+
+replace restart {
+    %1 (%2)
+    inr %2
+} by {
+    %1 (%2+)
+} if canAssign(%1 %2 'autoindex-byte'), notVolatile(), notUsed('nf' 'zf' 'cf' 'of')
+
+replace restart {
+    dcr %2
+    %1 (%2)
+} by {
+    %1 (-%2)
+} if canAssign(%1 %2 'autoindex-byte'), notVolatile(), notUsed('nf' 'zf' 'cf' 'of')
+
+replace restart {
+    %1 (%2)
+    %4 %5
+    inr %2
+} by {
+    %1 (%2+)
+    %4 %5
+} if canAssign(%1 %2 'autoindex-byte'), notVolatile(), notUsed('nf' 'zf' 'cf' 'of'), canAssign(%1 %4 'autoindex-spill-op'), canAssign(%2 %5 'autoindex-spill')
+
+replace restart {
+    %1 %3(%2)
+    inr %2
+} by {
+    %1 %3(%2+)
+} if canAssign(%1 %2 'autoindex-byte'), notVolatile(), notUsed('nf' 'zf' 'cf' 'of'), canAssign(%2 %3 'autoindex-offset')
+
+replace restart {
+    dcr %2
+    %1 %3(%2)
+} by {
+    %1 %3(-%2)
+} if canAssign(%1 %2 'autoindex-byte'), notVolatile(), notUsed('nf' 'zf' 'cf' 'of'), canAssign(%2 %3 'autoindex-offset')
+
+replace restart {
+    %1 %3(%2)
+    %4 %5
+    inr %2
+} by {
+    %1 %3(%2+)
+    %4 %5
+} if canAssign(%1 %2 'autoindex-byte'), notVolatile(), notUsed('nf' 'zf' 'cf' 'of'), canAssign(%2 %3 'autoindex-offset'), canAssign(%1 %4 'autoindex-spill-op'), canAssign(%2 %5 'autoindex-spill')
+
+replace restart {
+    %1 (%2)
+    inr %2
+    inr %2
+} by {
+    %1 (%2+)
+} if canAssign(%1 %2 'autoindex-word'), notVolatile(), notUsed('nf' 'zf' 'cf' 'of')
+
+replace restart {
+    dcr %2
+    dcr %2
+    %1 (%2)
+} by {
+    %1 (-%2)
+} if canAssign(%1 %2 'autoindex-word'), notVolatile(), notUsed('nf' 'zf' 'cf' 'of')
+
+replace restart {
+    %1 (%2)
+    %4 %5
+    inr %2
+    inr %2
+} by {
+    %1 (%2+)
+    %4 %5
+} if canAssign(%1 %2 'autoindex-word'), notVolatile(), notUsed('nf' 'zf' 'cf' 'of'), canAssign(%1 %4 'autoindex-spill-op'), canAssign(%2 %5 'autoindex-spill')
+
+replace restart {
+    %1 %3(%2)
+    inr %2
+    inr %2
+} by {
+    %1 %3(%2+)
+} if canAssign(%1 %2 'autoindex-word'), notVolatile(), notUsed('nf' 'zf' 'cf' 'of'), canAssign(%2 %3 'autoindex-offset')
+
+replace restart {
+    dcr %2
+    dcr %2
+    %1 %3(%2)
+} by {
+    %1 %3(-%2)
+} if canAssign(%1 %2 'autoindex-word'), notVolatile(), notUsed('nf' 'zf' 'cf' 'of'), canAssign(%2 %3 'autoindex-offset')
+
+replace restart {
+    %1 %3(%2)
+    %4 %5
+    inr %2
+    inr %2
+} by {
+    %1 %3(%2+)
+    %4 %5
+} if canAssign(%1 %2 'autoindex-word'), notVolatile(), notUsed('nf' 'zf' 'cf' 'of'), canAssign(%2 %3 'autoindex-offset'), canAssign(%1 %4 'autoindex-spill-op'), canAssign(%2 %5 'autoindex-spill')
+
+replace restart {
+    %1 0(%2+)
+} by {
+    %1 (%2+)
+} if canAssign(%1 %2 'autoindex-any')
+
+replace restart {
+    %1 0(-%2)
+} by {
+    %1 (-%2)
+} if canAssign(%1 %2 'autoindex-any')
+

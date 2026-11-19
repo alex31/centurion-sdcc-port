@@ -1518,7 +1518,9 @@ optimizeNarrowOpNet (iCode *ic)
         width = 8;
       if (width >= bitsForType (operandType (ic->result)))
         return;
-      if (width > port->s.bitint_maxwidth)
+      // CPU6 accepts explicit 48-bit scalars, but does not yet lower the
+      // arbitrary intermediate widths introduced by this transformation.
+      if (width > port->s.bitint_maxwidth || TARGET_IS_CPU6)
         return;
 #if 0
       std::cout << "Found optimizeable unoptimized unsigned integer net! New width: " << width << "\n";
@@ -1537,7 +1539,7 @@ optimizeNarrowOpNet (iCode *ic)
       width = ((width + 7) & (-8)); // Round up to multiple of 8.
       if (width >= bitsForType (operandType (ic->result)))
         return;
-      if (width > port->s.bitint_maxwidth)
+      if (width > port->s.bitint_maxwidth || TARGET_IS_CPU6)
         return;
 #if 0
       std::cout << "Found optimizeable unoptimized signed integer net! New width: " << width << "\n";

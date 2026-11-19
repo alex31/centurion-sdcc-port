@@ -1619,6 +1619,10 @@ addSymChain (symbol **symHead)
       /* if already exists in the symbol table on the same level, ignoring sublevels */
       if ((csym = findSymWithLevel (SymbolTab, sym)) && csym->level / LEVEL_UNIT == sym->level / LEVEL_UNIT)
         {
+          if (sym->cpu6_mmu_page && csym->cpu6_mmu_page && sym->cpu6_mmu_page != csym->cpu6_mmu_page)
+            werror (E_SYNTAX_ERROR, "conflicting mmu_page declarations");
+          if (!sym->cpu6_mmu_page) sym->cpu6_mmu_page = csym->cpu6_mmu_page;
+          if (!csym->cpu6_mmu_page) csym->cpu6_mmu_page = sym->cpu6_mmu_page;
           /* if not formal parameter and not in file scope
              then show symbol redefined error
              else check if symbols have compatible types */
@@ -5079,6 +5083,7 @@ symbol *fsdiv;
 symbol *fseq;
 symbol *fsneq;
 symbol *fslt;
+symbol *fsle;
 
 symbol *sdcc_atomic_load;
 symbol *sdcc_atomic_store;
@@ -5370,6 +5375,7 @@ initCSupport (void)
   fseq = funcOfType ("__fseq", boolType, floatTypeNear, 2, options.float_rent);
   fsneq = funcOfType ("__fsneq", boolType, floatTypeNear, 2, options.float_rent);
   fslt = funcOfType ("__fslt", boolType, floatTypeNear, 2, options.float_rent);
+  fsle = funcOfType ("__fsle", boolType, floatTypeNear, 2, options.float_rent);
 
   for (tofrom = 0; tofrom < 2; tofrom++)
     {
