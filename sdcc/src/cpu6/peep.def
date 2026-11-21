@@ -3,12 +3,6 @@
 
 replace restart {
     jmp %1
-} by {
-    bra %1
-} if labelInRange(%1)
-
-replace restart {
-    jmp %1
 %1:
 } by {
 %1:
@@ -31,8 +25,26 @@ replace restart {
 } if labelInRange(%2)
 
 replace restart {
+    bz %1
+    bra %2
+%1:
+} by {
+    bnz %2
+%1:
+} if labelInRange(%2)
+
+replace restart {
     bnz %1
     jmp %2
+%1:
+} by {
+    bz %2
+%1:
+} if labelInRange(%2)
+
+replace restart {
+    bnz %1
+    bra %2
 %1:
 } by {
     bz %2
@@ -49,6 +61,15 @@ replace restart {
 } if labelInRange(%2)
 
 replace restart {
+    bm %1
+    bra %2
+%1:
+} by {
+    bp %2
+%1:
+} if labelInRange(%2)
+
+replace restart {
     bp %1
     jmp %2
 %1:
@@ -58,8 +79,62 @@ replace restart {
 } if labelInRange(%2)
 
 replace restart {
+    bp %1
+    bra %2
+%1:
+} by {
+    bm %2
+%1:
+} if labelInRange(%2)
+
+replace restart {
+    bgz %1
+    jmp %2
+%1:
+} by {
+    ble %2
+%1:
+} if labelInRange(%2)
+
+replace restart {
+    bgz %1
+    bra %2
+%1:
+} by {
+    ble %2
+%1:
+} if labelInRange(%2)
+
+replace restart {
+    ble %1
+    jmp %2
+%1:
+} by {
+    bgz %2
+%1:
+} if labelInRange(%2)
+
+replace restart {
+    ble %1
+    bra %2
+%1:
+} by {
+    bgz %2
+%1:
+} if labelInRange(%2)
+
+replace restart {
     bl %1
     jmp %2
+%1:
+} by {
+    bnl %2
+%1:
+} if labelInRange(%2)
+
+replace restart {
+    bl %1
+    bra %2
 %1:
 } by {
     bnl %2
@@ -74,6 +149,21 @@ replace restart {
     bl %2
 %1:
 } if labelInRange(%2)
+
+replace restart {
+    bnl %1
+    bra %2
+%1:
+} by {
+    bl %2
+%1:
+} if labelInRange(%2)
+
+replace restart {
+    jmp %1
+} by {
+    bra %1
+} if labelInRange(%1)
 
 replace restart {
     xfr %1,%2
@@ -108,7 +198,12 @@ replace restart {
 replace restart {
     xfr %1,%2
 } by {
-} if canAssign(%1 %2), same(%2 'x' 'y' 'z'), notUsed(%2 'nf' 'zf')
+} if canAssign(%1 %2), same(%2 'b' 'x' 'y' 'z'), notUsed(%2 'nf' 'zf')
+
+replace restart {
+    xab
+} by {
+} if notUsed('b' 'nf' 'zf')
 
 replace restart {
     xfr %1,b
@@ -260,6 +355,134 @@ replace restart {
     ldx %1
 } if notUsed('b'), canAssign('b' %1 'stable-load')
 
+// Direct CPU6 loads/stores for Y/Z without routing through A/B.
+replace restart {
+    ldb %1
+    xfr b,%2
+} by {
+    clr %2,%1
+} if same(%2 'y' 'z'), notUsed('b' 'cf' 'of'), canAssign('b' %1 'small-const')
+
+replace restart {
+    lda %1
+    xfr a,%2
+} by {
+    clr %2,%1
+} if same(%2 'y' 'z'), notUsed('a' 'cf' 'of'), canAssign('a' %1 'small-const')
+
+replace restart {
+    ldb %1
+    xfr b,%2
+} by {
+    ldw %2,%1
+} if same(%2 'y' 'z'), notUsed('b'), notVolatile(), canAssign('b' %1 'extended-load')
+
+replace restart {
+    lda %1
+    xfr a,%2
+} by {
+    ldw %2,%1
+} if same(%2 'y' 'z'), notUsed('a'), notVolatile(), canAssign('a' %1 'extended-load')
+
+replace restart {
+    xfr %1,b
+    stb %2
+} by {
+    stw %1,%2
+} if same(%1 'y' 'z'), notUsed('b'), notVolatile(), canAssign('b' %2 'extended-store')
+
+replace restart {
+    xfr %1,a
+    sta %2
+} by {
+    stw %1,%2
+} if same(%1 'y' 'z'), notUsed('a'), notVolatile(), canAssign('a' %2 'extended-store')
+
+// Direct CPU6 memory-to-register word ALU (0x50-0x54 extended modes).
+replace restart {
+    lda %1
+    aab
+} by {
+    add %1,b
+} if notUsed('a'), notVolatile(), canAssign('a' %1 'alu-memory')
+
+replace restart {
+    lda %1
+    sab
+} by {
+    sub %1,b
+} if notUsed('a'), notVolatile(), canAssign('a' %1 'alu-memory')
+
+replace restart {
+    lda %1
+    nab
+} by {
+    and %1,b
+} if notUsed('a'), notVolatile(), canAssign('a' %1 'alu-memory')
+
+replace restart {
+    lda %1
+    ori a,b
+} by {
+    ori %1,b
+} if notUsed('a'), notVolatile(), canAssign('a' %1 'alu-memory')
+
+replace restart {
+    lda %1
+    ore a,b
+} by {
+    ore %1,b
+} if notUsed('a'), notVolatile(), canAssign('a' %1 'alu-memory')
+
+// Direct CPU6 memory read-modify-write increment/decrement (0x30/0x31).
+replace restart {
+    ldb %1
+    inr b
+    stb %1
+} by {
+    inr %1
+} if notUsed('b' 'cf' 'of'), notVolatile(), canAssign('b' %1 'rmw-memory')
+
+replace restart {
+    ldb %1
+    inr b,%2
+    stb %1
+} by {
+    inr %1,%2
+} if notUsed('b' 'cf' 'of'), notVolatile(), canAssign('b' %1 'rmw-memory')
+
+replace restart {
+    ldb %1
+    dcr b
+    stb %1
+} by {
+    dcr %1
+} if notUsed('b' 'cf' 'of'), notVolatile(), canAssign('b' %1 'rmw-memory')
+
+replace restart {
+    ldb %1
+    dcr b,%2
+    stb %1
+} by {
+    dcr %1,%2
+} if notUsed('b' 'cf' 'of'), notVolatile(), canAssign('b' %1 'rmw-memory')
+
+replace restart {
+    lda %1
+    ina
+    sta %1
+} by {
+    inr %1
+} if notUsed('a' 'cf' 'of'), notVolatile(), canAssign('a' %1 'rmw-memory')
+
+replace restart {
+    lda %1
+    dca
+    sta %1
+} by {
+    dcr %1
+} if notUsed('a' 'cf' 'of'), notVolatile(), canAssign('a' %1 'rmw-memory')
+
 replace restart {
     xfr a,b
     stb %1
@@ -304,8 +527,7 @@ replace restart {
     lda 2
     aab
 } by {
-    inr b
-    inr b
+    inr b,2
 } if notUsed('a' 'cf' 'of')
 
 replace restart {
@@ -322,13 +544,70 @@ replace restart {
 } by {
 } if notUsed('a' 'nf' 'zf' 'cf' 'of')
 
+// Extended CPU6 immediate word ALU (21t vs 22-27t, preserves A).
+replace restart {
+    lda %1
+    aab
+} by {
+    add %1,b
+} if notUsed('a'), canAssign('a' %1 'immediate-value')
+
+replace restart {
+    lda %1
+    ori a,b
+} by {
+    ori %1,b
+} if notUsed('a'), canAssign('a' %1 'immediate-value')
+
+replace restart {
+    lda %1
+    ore a,b
+} by {
+    ore %1,b
+} if notUsed('a'), canAssign('a' %1 'immediate-value')
+
+// ADD r,r is 15 microsteps vs SLR r at 20 microsteps, with identical flags.
+replace restart {
+    slr %1
+} by {
+    add %1,%1
+} if same(%1 'b' 'x' 'y' 'z')
+
 // These instructions have already set N/Z from the same full word in B.
 replace restart {
     %1
     ori b,b
 } by {
     %1
-} if same(%1 'aab' 'sab' 'nab' 'inr b' 'dcr b' 'slr b' 'srr b' 'rrr b' 'rlr b' 'ori a,b' 'ore a,b')
+} if same(%1 'aab' 'sab' 'nab' 'inr b' 'dcr b' 'ivr b' 'ivr b,2' 'slr b' 'srr b' 'rrr b' 'rlr b' 'ori a,b' 'ore a,b' 'add b,b')
+
+replace restart {
+    inr b,%1
+    ori b,b
+} by {
+    inr b,%1
+}
+
+replace restart {
+    dcr b,%1
+    ori b,b
+} by {
+    dcr b,%1
+}
+
+replace restart {
+    %1 %2,b
+    ori b,b
+} by {
+    %1 %2,b
+} if same(%1 'add' 'sub' 'and' 'ori' 'ore')
+
+replace restart {
+    ldw b,%1
+    ori b,b
+} by {
+    ldw b,%1
+}
 
 replace restart {
     ldb %1
@@ -528,4 +807,19 @@ replace restart {
 } by {
     %1 (-%2)
 } if canAssign(%1 %2 'autoindex-any')
+
+// Collapse surviving adjacent unit updates into a single constant-time op.
+replace restart {
+    inr %1
+    inr %1
+} by {
+    inr %1,2
+} if canAssign('a' %1), notUsed('cf' 'of')
+
+replace restart {
+    dcr %1
+    dcr %1
+} by {
+    dcr %1,2
+} if canAssign('a' %1), notUsed('cf' 'of')
 

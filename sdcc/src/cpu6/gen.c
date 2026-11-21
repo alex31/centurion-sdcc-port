@@ -496,11 +496,51 @@ static void memory_done (void)
   }
 }
 
+static bool distant_stack_slot (symbol *sym, int offset, unsigned *pos_out)
+{
+  cpu6_slot *slot = slot_for (sym);
+  if ((slot && slot->address_base) || !stacked (sym)) return false;
+  int pos = stack_offset (sym) + offset;
+  if (pos >= -128 && pos <= 127) return false;
+  if (frame_base && pos - pushed - (int)frame_center >= -128 &&
+      pos - pushed - (int)frame_center <= 127) return false;
+  *pos_out = (unsigned)pos & 65535;
+  return true;
+}
+
+static void emit_word_load (char reg, symbol *sym, int offset)
+{
+  unsigned pos;
+  if (distant_stack_slot (sym, offset, &pos)) {
+    emit ("\tldw %c,%u(s)\n", reg, pos);
+    return;
+  }
+  char mem[400];
+  memory_operand (sym, offset, mem, sizeof (mem));
+  emit ("\tld%c %s\n", reg, mem);
+  memory_done ();
+}
+
+static void emit_word_store (char reg, symbol *sym, int offset)
+{
+  unsigned pos;
+  if (distant_stack_slot (sym, offset, &pos)) {
+    emit ("\tstw %c,%u(s)\n", reg, pos);
+    return;
+  }
+  char mem[400];
+  memory_operand (sym, offset, mem, sizeof (mem));
+  emit ("\tst%c %s\n", reg, mem);
+  memory_done ();
+}
+
 static void address (symbol *sym, int offset)
 {
-  if (stacked (sym))
-    emit ("\tldb %u\n\tadd s,b\n", (unsigned)(stack_offset (sym) + offset) & 65535);
-  else emit ("\tldb %s+%d\n", symbol_name (sym), offset);
+  if (stacked (sym)) {
+    unsigned pos = (unsigned)(stack_offset (sym) + offset) & 65535;
+    if (!pos) emit ("\txfr s,b\n");
+    else emit ("\tadd s,%u,b\n", pos);
+  } else emit ("\tldb %s+%d\n", symbol_name (sym), offset);
 }
 
 static void extend_byte (bool unsign)
@@ -553,17 +593,16 @@ static void load (operand *op, unsigned wanted)
       else if (wanted == 4) emit ("\tlda %u\n\tsta (__hireg)\n", (unsigned)(value >> 16) & 65535);
       emit ("\tldb %u\n", (unsigned)value & 65535);
     } else {
-      char mem[400]; symbol *sym = OP_SYMBOL (op);
+      symbol *sym = OP_SYMBOL (op);
       if (wanted == 6) {
-        memory_operand (sym, 0, mem, sizeof (mem));
-        emit ("\tlda %s\n\tsta (__hireg)\n", mem); memory_done ();
+        emit_word_load ('a', sym, 0);
+        emit ("\tsta (__hireg)\n");
       }
       if (wanted >= 4) {
-        memory_operand (sym, 2, mem, sizeof (mem));
-        emit ("\tlda %s\n\tsta (%s)\n", mem, wanted == 6 ? "__cpu6_mid48" : "__hireg"); memory_done ();
+        emit_word_load ('a', sym, 2);
+        emit ("\tsta (%s)\n", wanted == 6 ? "__cpu6_mid48" : "__hireg");
       }
-      memory_operand (sym, 4, mem, sizeof (mem));
-      emit ("\tldb %s\n", mem); memory_done ();
+      emit_word_load ('b', sym, 4);
       if (wanted == 6 && IS_ITEMP (op) && !sym->addrtaken) {
         b_cached = sym; b_cached_width = 6;
       }
@@ -601,15 +640,16 @@ static void load (operand *op, unsigned wanted)
   if (slot && slot->transient && !cached) unsupported ("lost transient B value");
   if (!cached && slot && slot->reg) emit ("\txfr %c,b\n", slot->reg);
   else if (!cached) {
-    char mem[400];
     if (size == 4 && wanted == 4) {
-      memory_operand (sym, 0, mem, sizeof (mem));
-      emit ("\tldb %s\n\tstb (__hireg)\n", mem);
-      memory_done ();
+      emit_word_load ('b', sym, 0);
+      emit ("\tstb (__hireg)\n");
     }
-    memory_operand (sym, size == 4 ? 2 : 0, mem, sizeof (mem));
-    emit (size == 1 ? "\tldbb %s\n" : "\tldb %s\n", mem);
-    memory_done ();
+    if (size == 1) {
+      char mem[400];
+      memory_operand (sym, 0, mem, sizeof (mem));
+      emit ("\tldbb %s\n", mem);
+      memory_done ();
+    } else emit_word_load ('b', sym, size == 4 ? 2 : 0);
   }
   if (size == 1) extend_byte (unsigned_op (op));
   if (wanted == 4 && size < 4) extend_long (unsigned_op (op));
@@ -642,12 +682,7 @@ static void load_word_a (operand *op)
       emit ("\txfr b,a\n");
     else if (slot && slot->reg) emit ("\txfr %c,a\n", slot->reg);
     else if (slot && slot->transient) unsupported ("lost transient A source");
-    else {
-      char mem[400];
-      memory_operand (sym, 0, mem, sizeof (mem));
-      emit ("\tlda %s\n", mem);
-      memory_done ();
-    }
+    else emit_word_load ('a', sym, 0);
     return;
   }
   load (op, 2);
@@ -697,12 +732,7 @@ static void load_scalar_part (operand *op, unsigned offset, char reg, unsigned b
   if (IS_VALOP (op)) {
     unsigned long long value = (unsigned long long)(long long)operandLitValue (op);
     emit ("\tld%c %u\n", reg, (unsigned)(value >> ((bytes - offset - 2) * 8)) & 65535);
-  } else {
-    char mem[400];
-    memory_operand (OP_SYMBOL (op), offset, mem, sizeof (mem));
-    emit ("\tld%c %s\n", reg, mem);
-    memory_done ();
-  }
+  } else emit_word_load (reg, OP_SYMBOL (op), offset);
 }
 
 static void load_long_part (operand *op, unsigned offset, char reg)
@@ -725,16 +755,26 @@ static bool consumed_next (operand *op)
      home only creates a dead spill and increases interference. This is not
      valid for byte extension, aggregate addresses, variable shifts (which
      push the left operand through B), or split-word lowering. */
-  if (!cpu6_no_rhs_forwarding && width (op) == 2 &&
+  if (!cpu6_no_rhs_forwarding &&
       IS_SYMOP (next->right) && OP_SYMBOL (next->right) == OP_SYMBOL (op) &&
-      next->left && width (next->left) == 2 &&
+      next->left &&
       !IS_ARRAY (operandType (next->left)) && !IS_FUNC (operandType (next->left))) {
-    switch (next->op) {
-      case '+': case '-': case '*': case '/': case '%': case BITWISEAND: case '|': case '^':
-        if (width (next->result) == 2) return true;
-        break;
-      case EQ_OP: case NE_OP: case '<': case '>': case LE_OP: case GE_OP:
-        return true;
+    if (width (op) == 2 && width (next->left) == 2) {
+      switch (next->op) {
+        case '+': case '-': case '*': case '/': case '%': case BITWISEAND: case '|': case '^':
+          if (width (next->result) == 2) return true;
+          break;
+        case EQ_OP: case NE_OP: case '<': case '>': case LE_OP: case GE_OP:
+          return true;
+      }
+    } else if (!cpu6_no_byte_arithmetic && width (op) == 1 &&
+               width (next->left) <= 2 && width (next->result) == 1 &&
+               !IS_BOOL (operandType (next->result)) &&
+               IS_INTEGRAL (operandType (next->left)) && IS_INTEGRAL (operandType (next->right))) {
+      switch (next->op) {
+        case '+': case '-': case BITWISEAND: case '|': case '^':
+          return true;
+      }
     }
   }
   if (width (op) == 6)
@@ -751,8 +791,16 @@ static bool consumed_next (operand *op)
         return false;
     }
   operand *first = NULL;
-  if (POINTER_SET (next)) first = next->result;
-  else switch (next->op) {
+  if (POINTER_SET (next)) {
+    first = next->result;
+    if (width (op) <= 2 && IS_SYMOP (next->right) && OP_SYMBOL (next->right) == OP_SYMBOL (op) &&
+        !(IS_SYMOP (next->result) && OP_SYMBOL (next->result) == OP_SYMBOL (op)) &&
+        !(IS_PTR (operandType (next->result)) && IS_BITFIELD (operandType (next->result)->next))) {
+      cpu6_slot *ptr_slot = IS_SYMOP (next->result) ? slot_for (OP_SYMBOL (next->result)) : NULL;
+      if (word_register (next->result) || (ptr_slot && ptr_slot->address_base))
+        return true;
+    }
+  } else switch (next->op) {
     case '=': case CAST: first = next->right; break;
     case '+': case '-': case '*': case '/': case '%': case BITWISEAND:
     case '|': case '^': case LEFT_OP: case RIGHT_OP: case UNARYMINUS:
@@ -778,28 +826,48 @@ static void store (operand *op)
     emit ("\txfr b,%c\n", slot->reg);
     return;
   }
-  char mem[400];
   if (size == 6) {
-    memory_operand (sym, 0, mem, sizeof (mem));
-    emit ("\tlda (__hireg)\n\tsta %s\n", mem); memory_done ();
-    memory_operand (sym, 2, mem, sizeof (mem));
-    emit ("\tlda (__cpu6_mid48)\n\tsta %s\n", mem); memory_done ();
-    memory_operand (sym, 4, mem, sizeof (mem));
-    emit ("\tstb %s\n", mem); memory_done ();
+    emit ("\tlda (__hireg)\n"); emit_word_store ('a', sym, 0);
+    emit ("\tlda (__cpu6_mid48)\n"); emit_word_store ('a', sym, 2);
+    emit_word_store ('b', sym, 4);
     return;
   }
   if (size == 4) {
-    memory_operand (sym, 0, mem, sizeof (mem));
-    emit ("\tlda (__hireg)\n\tsta %s\n", mem);
-    memory_done ();
+    emit ("\tlda (__hireg)\n");
+    emit_word_store ('a', sym, 0);
   }
-  memory_operand (sym, size == 4 ? 2 : 0, mem, sizeof (mem));
-  emit (size == 1 ? "\tstbb %s\n" : "\tstb %s\n", mem);
-  memory_done ();
+  if (size == 1) {
+    char mem[400];
+    memory_operand (sym, 0, mem, sizeof (mem));
+    emit ("\tstbb %s\n", mem);
+    memory_done ();
+  } else emit_word_store ('b', sym, size == 4 ? 2 : 0);
 }
 
 static void push (operand *op, unsigned size)
 {
+  if (size == 4 && width (op) == 4 && !IS_FLOAT (operandType (op)) &&
+      !IS_ARRAY (operandType (op)) && !IS_FUNC (operandType (op))) {
+    if (IS_VALOP (op)) {
+      unsigned long value = (unsigned long)(long long)operandLitValue (op);
+      emit ("\tldb %u\n\tstb (-s)\n\tlda %u\n\tsta (-s)\n",
+            (unsigned)value & 65535, (unsigned)(value >> 16) & 65535);
+      pushed += 4;
+      b_cached = NULL;
+      return;
+    }
+    if (IS_SYMOP (op) && !isOperandVolatile (op, false) &&
+        (cpu6_stack_only || b_cached != OP_SYMBOL (op) || b_cached_width < 4)) {
+      load_long_part (op, 2, 'b');
+      emit ("\tstb (-s)\n");
+      pushed += 2;
+      load_long_part (op, 0, 'a');
+      emit ("\tsta (-s)\n");
+      pushed += 2;
+      b_cached = NULL;
+      return;
+    }
+  }
   load (op, size);
   emit ("\tstb (-s)\n");
   pushed += 2;
@@ -1002,18 +1070,21 @@ static void jump_condition (unsigned op, bool unsign, iCode *branch, bool no_ove
     if (op == LE_OP) emit ("\tbz L%u\n", take);
     emit (op == '<' || op == LE_OP ? "\tbl L%u\n" : "\tbnl L%u\n", skip);
   } else {
-    if (op == '>') emit ("\tbz L%u\n", skip);
-    if (op == LE_OP) emit ("\tbz L%u\n", take);
-    if (no_overflow)
-      emit (op == '<' || op == LE_OP ? "\tbp L%u\n" : "\tbm L%u\n", skip);
-    else {
+    if (no_overflow) {
+      if (op == '>') emit ("\tble L%u\n", skip);
+      else if (op == LE_OP) emit ("\tbgz L%u\n", skip);
+      else emit (op == '<' ? "\tbp L%u\n" : "\tbm L%u\n", skip);
+    } else {
+      if (op == '>') emit ("\tbz L%u\n", skip);
+      if (op == LE_OP) emit ("\tbz L%u\n", take);
       emit ("\tbf L%u\n", overflow);
       emit (op == '<' || op == LE_OP ? "\tbp L%u\n" : "\tbm L%u\n", skip);
       emit ("\tbra L%u\nL%u:\n", take, overflow);
       emit (op == '<' || op == LE_OP ? "\tbm L%u\n" : "\tbp L%u\n", skip);
     }
   }
-  if (op == LE_OP || (!unsign && op != EQ_OP && op != NE_OP))
+  if ((op == LE_OP && (unsign || !no_overflow)) ||
+      (!unsign && !no_overflow && op != EQ_OP && op != NE_OP))
     emit ("L%u:\n", take);
   emit ("\tjmp L%d\nL%u:\n", target->key, skip);
   branch->generated = 1;
@@ -1097,9 +1168,43 @@ static void compare (iCode *ic)
       jump_condition (ic->op, false, branch, true);
       return;
     }
+    unsigned cmp_op = ic->op;
+    cpu6_slot *rslot = IS_SYMOP (ic->right) ? slot_for (OP_SYMBOL (ic->right)) : NULL;
+    char lreg = word_register (ic->left);
+    if (branch && lreg && (cmp_op == EQ_OP || cmp_op == NE_OP) && rslot && rslot->address_base) {
+      emit ("\tsub %c,%s+%u,b\n", lreg, symbol_name (rslot->address_base), (unsigned)rslot->address_offset);
+      jump_condition (cmp_op, unsign, branch, false);
+      return;
+    }
+    if (branch && IS_VALOP (ic->right)) {
+      unsigned rval = (unsigned)(long long)operandLitValue (ic->right) & 65535;
+      /* CPU6 extended SUB computes (imm - reg), reversing operand order. */
+      unsigned swapped = cmp_op == '<' ? '>' : cmp_op == '>' ? '<' :
+                         cmp_op == LE_OP ? GE_OP : cmp_op == GE_OP ? LE_OP : cmp_op;
+      if (unsign && rval > 0) {
+        if (cmp_op == '<') { swapped = GE_OP; rval--; }
+        else if (cmp_op == GE_OP) { swapped = '<'; rval--; }
+      }
+      if (lreg) emit ("\tsub %c,%u,b\n", lreg, rval);
+      else { load (ic->left, 2); emit ("\tsub %u,b\n", rval); }
+      bool no_overflow = false;
+      if (!unsign && swapped != EQ_OP && swapped != NE_OP) {
+        struct valinfo a = word_info (ic, ic->left);
+        long long rs = (int16_t)rval;
+        no_overflow = !a.anything && !a.nothing &&
+          a.min >= -32768 && a.max <= 32767 &&
+          rs - a.max >= -32768 && rs - a.min <= 32767;
+      }
+      jump_condition (swapped, unsign, branch, no_overflow);
+      return;
+    }
     if (IS_VALOP (ic->right)) {
+      unsigned rval = (unsigned)(long long)operandLitValue (ic->right) & 65535;
       load (ic->left, 2);
-      emit ("\tlda %u\n\tsub b,a\n", (unsigned)(long long)operandLitValue (ic->right) & 65535);
+      emit ("\tlda %u\n\tsub b,a\n", rval);
+    } else if (lreg) {
+      load (ic->right, 2);
+      emit ("\tsub %c,b\n", lreg);
     } else {
       load_word_a (ic->left);
       load (ic->right, 2);
@@ -1107,14 +1212,14 @@ static void compare (iCode *ic)
     }
     if (branch) {
       bool no_overflow = false;
-      if (!unsign && ic->op != EQ_OP && ic->op != NE_OP) {
+      if (!unsign && cmp_op != EQ_OP && cmp_op != NE_OP) {
         struct valinfo a = word_info (ic, ic->left);
         struct valinfo b = word_info (ic, ic->right);
         no_overflow = !a.anything && !a.nothing && !b.anything && !b.nothing &&
           a.min >= -32768 && a.max <= 32767 && b.min >= -32768 && b.max <= 32767 &&
           a.min - b.max >= -32768 && a.max - b.min <= 32767;
       }
-      jump_condition (ic->op, unsign, branch, no_overflow);
+      jump_condition (cmp_op, unsign, branch, no_overflow);
       return;
     }
     emit ("\tjsr __cc%s%s\n", name, suffix);
@@ -1140,10 +1245,7 @@ static void private_word (const char *instruction, unsigned offset)
 {
   unsigned pos = private_base + offset + pushed;
   if (pos <= 127) emit ("\t%s %u(s)\n", instruction, pos);
-  else {
-    emit ("\tstx (-s)\n\tldx %u\n\tadd s,x\n\t%s (x)\n\tldx (s+)\n",
-          pos + 2, instruction);
-  }
+  else emit ("\t%s %c,%u(s)\n", instruction[0] == 'l' ? "ldw" : "stw", instruction[2], pos);
 }
 
 static cpu6_div_pair *division_pair (iCode *ic)
@@ -1223,14 +1325,14 @@ static void paired_word_division (iCode *ic, cpu6_div_pair *pair)
     unsigned r_positive = local_label++, q_positive = local_label++;
     emit ("\tsta (-s)\n\tore b,a\n\tsta (-s)\n\tlda 2(s)\n"); pushed += 4;
     emit ("\tori a,a\n\tbp L%u\n\tiva\n\tina\nL%u:\n", a_positive, a_positive);
-    emit ("\tori b,b\n\tbp L%u\n\tivr b\n\tinr b\nL%u:\n", b_positive, b_positive);
+    emit ("\tori b,b\n\tbp L%u\n\tivr b,2\nL%u:\n", b_positive, b_positive);
     emit ("\tdiv b,a\n\tstb (-s)\n\txab\n"); pushed += 2;
-    emit ("\tlda 4(s)\n\tbp L%u\n\tivr b\n\tinr b\nL%u:\n", r_positive, r_positive);
+    emit ("\tlda 4(s)\n\tbp L%u\n\tivr b,2\nL%u:\n", r_positive, r_positive);
     emit ("\tstb (-s)\n\tldb 2(s)\n"); pushed += 2;
-    emit ("\tlda 4(s)\n\tbp L%u\n\tivr b\n\tinr b\nL%u:\n", q_positive, q_positive);
+    emit ("\tlda 4(s)\n\tbp L%u\n\tivr b,2\nL%u:\n", q_positive, q_positive);
     if (ic->op == '/') { emit ("\tlda (s)\n"); private_word ("sta", pair->offset); }
     else { private_word ("stb", pair->offset); emit ("\tldb (s)\n"); }
-    emit ("\tlda 8\n\tadd a,s\n"); pushed -= 8;
+    emit ("\tinr s,8\n"); pushed -= 8;
   }
   b_cached = NULL;
   arithmetic_result (ic);
@@ -1329,7 +1431,8 @@ static bool inplace_wide (iCode *ic)
     emit (add ? "\tbnl L%u\n" : "\tbl L%u\n", done);
     for (int offset = size - 4; offset >= 0; offset -= 2) {
       memory_operand (sym, offset, mem, sizeof (mem));
-      emit ("\tlda %s\n\t%s\n\tsta %s\n", mem, add ? "ina" : "dca", mem);
+      if (!offset) emit ("\t%s %s\n", add ? "inr" : "dcr", mem);
+      else emit ("\tlda %s\n\t%s\n\tsta %s\n", mem, add ? "ina" : "dca", mem);
       memory_done ();
       if (offset) {
         if (add) emit ("\tori a,a\n\tbnz L%u\n", done); /* INC preserves L; wrapping is detected by zero */
@@ -1382,8 +1485,17 @@ static void arithmetic (iCode *ic)
       arithmetic_result (ic);
       return;
     }
-    load_low_byte (ic->left, 'a');
-    load_low_byte (ic->right, 'b');
+    bool swap_byte = ic->op != '-' && !cpu6_stack_only &&
+      IS_SYMOP (ic->left) && b_cached == OP_SYMBOL (ic->left) && b_cached_width >= 1 &&
+      !(IS_SYMOP (ic->right) && b_cached == OP_SYMBOL (ic->right)) &&
+      !isOperandVolatile (ic->left, false) && !isOperandVolatile (ic->right, false);
+    if (swap_byte) {
+      load_low_byte (ic->right, 'a');
+      load_low_byte (ic->left, 'b');
+    } else {
+      load_low_byte (ic->left, 'a');
+      load_low_byte (ic->right, 'b');
+    }
     const char *instruction = ic->op == '+' ? "addb" : ic->op == '-' ? "subb" :
                               ic->op == BITWISEAND ? "andb" : ic->op == '|' ? "orib" : "oreb";
     emit ("\t%s al,bl\n", instruction);
@@ -1438,14 +1550,34 @@ static void arithmetic (iCode *ic)
     load_long_part (ic->left, 2, 'a'); load_long_part (ic->right, 2, 'b');
     emit ("\t%s\n\tstb (-s)\n", instruction); pushed += 2;
     if (ic->op == '+' || ic->op == '-') {
-      unsigned no_carry = local_label++, join = local_label++;
-      emit (ic->op == '+' ? "\tbnl L%u\n" : "\tbl L%u\n", no_carry);
-      load_long_part (ic->left, 0, 'a'); load_long_part (ic->right, 0, 'b');
-      emit ("\t%s\n", instruction);
-      emit (ic->op == '+' ? "\tinr b\n" : "\tdcr b\n");
-      emit ("\tbra L%u\nL%u:\n", join, no_carry);
-      load_long_part (ic->left, 0, 'a'); load_long_part (ic->right, 0, 'b');
-      emit ("\t%s\nL%u:\n", instruction, join);
+      /* Loads preserve L unless a distant stack slot must compute s+offset. */
+      bool direct_hi = true;
+      operand *ops[] = {ic->left, ic->right};
+      for (unsigned n = 0; n < 2; n++) {
+        if (!IS_SYMOP (ops[n])) continue;
+        symbol *s = OP_SYMBOL (ops[n]);
+        if (stacked (s)) {
+          int pos = stack_offset (s);
+          int zpos = pos - pushed - (int)frame_center;
+          if (!((pos >= -128 && pos <= 127) || (frame_base && zpos >= -128 && zpos <= 127)))
+            direct_hi = false;
+        }
+      }
+      if (direct_hi) {
+        unsigned no_carry = local_label++;
+        load_long_part (ic->left, 0, 'a'); load_long_part (ic->right, 0, 'b');
+        emit (ic->op == '+' ? "\tbnl L%u\n\tina\nL%u:\n\taab\n" : "\tbl L%u\n\tdca\nL%u:\n\tsab\n",
+              no_carry, no_carry);
+      } else {
+        unsigned no_carry = local_label++, join = local_label++;
+        emit (ic->op == '+' ? "\tbnl L%u\n" : "\tbl L%u\n", no_carry);
+        load_long_part (ic->left, 0, 'a'); load_long_part (ic->right, 0, 'b');
+        emit ("\t%s\n", instruction);
+        emit (ic->op == '+' ? "\tinr b\n" : "\tdcr b\n");
+        emit ("\tbra L%u\nL%u:\n", join, no_carry);
+        load_long_part (ic->left, 0, 'a'); load_long_part (ic->right, 0, 'b');
+        emit ("\t%s\nL%u:\n", instruction, join);
+      }
     } else {
       load_long_part (ic->left, 0, 'a'); load_long_part (ic->right, 0, 'b');
       emit ("\t%s\n", instruction);
@@ -1492,27 +1624,40 @@ static void arithmetic (iCode *ic)
       load (ic->left, 2);
       if (!value) emit ("\tldb 0\n");
       else if (value != 1) {
-        unsigned bit = 0x8000, shifts = 0, cost = 15;
-        while (!(value & bit)) bit >>= 1;
-        for (unsigned scan = bit >> 1; scan; scan >>= 1) {
-          shifts++;
-          if (value & scan) { cost += 15 + 5 * shifts + 9; shifts = 0; }
-        }
-        if (shifts) cost += 15 + 5 * shifts;
-        /* Measured microcode costs: XFR B,A=15, SLR B,n=15+5n, AAB=9,
-           immediate MUL=116. Combine consecutive shifts before comparing. */
-        if (optimize.codeSize || cost >= 116) emit ("\tmul %u,b\n", value);
-        else {
-          emit ("\txfr b,a\n");
-          shifts = 0;
-          while ((bit >>= 1)) {
+        if (!(value & (value - 1))) {
+          unsigned count = 0;
+          while ((value >>= 1)) count++;
+          if (count >= 8) {
+            emit ("\txfrb bl,bh\n\tclrb bl\n");
+            count -= 8;
+            if (count) emit ("\tslrb bh,%u\n", count);
+          } else if (count == 1) emit ("\tadd b,b\n");
+          else emit ("\tslr b,%u\n", count);
+        } else {
+          unsigned bit = 0x8000, shifts = 0, cost = 15;
+          while (!(value & bit)) bit >>= 1;
+          for (unsigned scan = bit >> 1; scan; scan >>= 1) {
             shifts++;
-            if (value & bit) {
-              emit ("\tslr b,%u\n\taab\n", shifts);
-              shifts = 0;
-            }
+            if (value & scan) { cost += (shifts == 1 ? 15 : 15 + 5 * shifts) + 10; shifts = 0; }
           }
-          if (shifts) emit ("\tslr b,%u\n", shifts);
+          if (shifts) cost += shifts == 1 ? 15 : 15 + 5 * shifts;
+          /* Measured microcode costs: XFR B,A=15, ADD B,B=15, SLR B,n=15+5n, AAB=10,
+             immediate MUL=116. Combine consecutive shifts before comparing. */
+          if (optimize.codeSize || cost >= 116) emit ("\tmul %u,b\n", value);
+          else {
+            emit ("\txfr b,a\n");
+            shifts = 0;
+            while ((bit >>= 1)) {
+              shifts++;
+              if (value & bit) {
+                if (shifts == 1) emit ("\tadd b,b\n\taab\n");
+                else emit ("\tslr b,%u\n\taab\n", shifts);
+                shifts = 0;
+              }
+            }
+            if (shifts == 1) emit ("\tadd b,b\n");
+            else if (shifts) emit ("\tslr b,%u\n", shifts);
+          }
         }
       }
       arithmetic_result (ic);
@@ -1547,11 +1692,15 @@ static void arithmetic (iCode *ic)
       load (ic->left, 2);
       bool logical_first = unsign && width (ic->left) > 1 && value < 8;
       if (value >= 8) {
-        if (ic->op == LEFT_OP) emit ("\txfrb bl,bh\n\tclrb bl\n");
-        else {
-          emit ("\txfrb bh,bl\n");
-          extend_byte (unsign);
+        if (ic->op == LEFT_OP) {
+          emit ("\txfrb bl,bh\n\tclrb bl\n");
+          value -= 8;
+          if (value) emit ("\tslrb bh,%u\n", value);
+          arithmetic_result (ic);
+          return;
         }
+        emit ("\txfrb bh,bl\n");
+        extend_byte (unsign);
         value -= 8;
       }
       struct valinfo source = word_info (ic, ic->left);
@@ -1564,7 +1713,8 @@ static void arithmetic (iCode *ic)
         emit ("\trl\n\trrr b\n");
         value--;
       }
-      if (value && value <= 16)
+      if (ic->op == LEFT_OP && value == 1) emit ("\tadd b,b\n");
+      else if (value && value <= 16)
         emit (ic->op == LEFT_OP ? "\tslr b,%u\n" : "\tsrr b,%u\n", value);
       else for (unsigned n = 0; n < value; n++)
         emit (ic->op == LEFT_OP ? "\tslr b\n" : "\tsrr b\n");
@@ -1578,21 +1728,32 @@ static void arithmetic (iCode *ic)
         if (value == 2 && IS_PTR (operandType (ic->result)))
           emit (ic->op == '+' ? "\tinr b\n\tinr b\n" : "\tdcr b\n\tdcr b\n");
         else if (value > 1) emit (ic->op == '+' ? "\tinr b,%u\n" : "\tdcr b,%u\n", value);
-      } else {
-        emit ("\tlda %u\n", value);
-        switch (ic->op) {
-          case '+': emit ("\taab\n"); break;
-          case '-': emit ("\tsub b,a\n\txab\n"); break;
-          case BITWISEAND: emit ("\tnab\n"); break;
-          case '|': emit ("\tori a,b\n"); break;
-          case '^': emit ("\tore a,b\n"); break;
-        }
-      }
+      } else if (ic->op == BITWISEAND && value == 0x00ff) emit ("\tclrb bh\n");
+      else if (ic->op == BITWISEAND && value == 0xff00) emit ("\tclrb bl\n");
+      else if (ic->op == BITWISEAND && value == 0) emit ("\tclr b\n");
+      else if (ic->op == '|' && value == 0x00ff) emit ("\tldbb 255\n");
+      else if (ic->op == '^' && value == 0xffff) emit ("\tivr b\n");
+      else if (ic->op == '-') emit ("\tadd %u,b\n", (65536 - value) & 65535);
+      else if (ic->op == '+') emit ("\tadd %u,b\n", value);
+      else if (ic->op == BITWISEAND) emit ("\tand %u,b\n", value);
+      else if (ic->op == '|') emit ("\tori %u,b\n", value);
+      else if (ic->op == '^') emit ("\tore %u,b\n", value);
       arithmetic_result (ic);
       return;
     }
   }
   if (size <= 2 && (ic->op == '*' || ic->op == '/' || ic->op == '%')) {
+    if (ic->op == '*') {
+      char reg = word_register (ic->left);
+      operand *other = ic->right;
+      if (!reg) { reg = word_register (ic->right); other = ic->left; }
+      if (reg) {
+        load (other, 2);
+        emit ("\tmul %c,b\n", reg);
+        arithmetic_result (ic);
+        return;
+      }
+    }
     load_word_a (ic->left);
     load (ic->right, 2);
     if (ic->op == '*') emit ("\tmul a,b\n");
@@ -1606,12 +1767,12 @@ static void arithmetic (iCode *ic)
       if (ic->op == '/') emit ("\tore b,a\n\tsta (-s)\n\tlda 2(s)\n");
       pushed += bytes;
       emit ("\tori a,a\n\tbp L%u\n\tiva\n\tina\nL%u:\n", positive_a, positive_a);
-      emit ("\tori b,b\n\tbp L%u\n\tivr b\n\tinr b\nL%u:\n", positive_b, positive_b);
+      emit ("\tori b,b\n\tbp L%u\n\tivr b,2\nL%u:\n", positive_b, positive_b);
       emit ("\tdiv b,a\n");
       if (ic->op == '%') emit ("\txab\n");
       /* Quotient takes the XOR of signs; remainder takes the dividend sign. */
-      emit ("\tlda (s)\n\tbp L%u\n\tivr b\n\tinr b\nL%u:\n", positive_result, positive_result);
-      emit ("\tlda %u\n\tadd a,s\n", bytes);
+      emit ("\tlda (s)\n\tbp L%u\n\tivr b,2\nL%u:\n", positive_result, positive_result);
+      emit ("\tinr s,%u\n", bytes);
       pushed -= bytes;
     }
     arithmetic_result (ic);
@@ -1628,7 +1789,7 @@ static void arithmetic (iCode *ic)
     pushed += 2;
     emit ("\tlda 8(s)\n\tldb 2(s)\n\tmul a,b\n\tlda (__hireg)\n\taab\n\tstb (__hireg)\n");
     emit ("\tlda 6(s)\n\tldb 4(s)\n\tmul a,b\n\tlda (__hireg)\n\taab\n\tstb (__hireg)\n");
-    emit ("\tldb (s+)\n\tlda 8\n\tadd a,s\n");
+    emit ("\tldb (s+)\n\tinr s,8\n");
     pushed -= 10;
     arithmetic_result (ic);
     return;
@@ -1655,11 +1816,12 @@ static void arithmetic (iCode *ic)
     emit ("\tjsr %s\n", helper);
     pushed -= size == 4 ? 4 : 2;
   } else {
-    char reg = ic->op == '-' ? 0 : word_register (ic->right);
-    operand *other = ic->left;
+    char reg = ic->op == '-' ? word_register (ic->left) : word_register (ic->right);
+    operand *other = ic->op == '-' ? ic->right : ic->left;
     if (!reg && ic->op != '-') { reg = word_register (ic->left); other = ic->right; }
     if (reg) {
-      const char *mnemonic = ic->op == '+' ? "add" : ic->op == BITWISEAND ? "and" :
+      const char *mnemonic = ic->op == '+' ? "add" : ic->op == '-' ? "sub" :
+                             ic->op == BITWISEAND ? "and" :
                              ic->op == '|' ? "ori" : ic->op == '^' ? "ore" : NULL;
       if (!mnemonic) unsupported ("register arithmetic operation");
       load (other, 2);
@@ -1838,19 +2000,21 @@ static void pointer_set (iCode *ic)
 
 static void adjust_frame (int delta, char scratch)
 {
+  (void)scratch;
   if (!delta) return;
   if (delta >= -16 && delta <= 16)
     emit (delta > 0 ? "\tinr s,%u\n" : "\tdcr s,%u\n", (unsigned)abs (delta));
   else
-    emit ("\tld%c %u\n\tadd %c,s\n", scratch, (unsigned)(uint16_t)delta, scratch);
+    emit ("\tadd %u,s\n", (unsigned)(uint16_t)delta);
 }
 
 static void return_frame (void)
 {
   adjust_frame (frame, 'a');
-  if (use_z) emit ("\tlda (s+)\n\txfr a,z\n");
-  if (use_y) emit ("\tlda (s+)\n\txfr a,y\n");
-  emit ("\tldx (s+)\n");
+  if (use_y && use_z) emit ("\tpop xh,zl\n");
+  else if (use_y) emit ("\tpop xh,yl\n");
+  else if (use_z) emit ("\tpop zh,zl\n\tldx (s+)\n");
+  else emit ("\tldx (s+)\n");
 }
 
 /* Follow only control-flow nodes with no observable work after the call.
@@ -2092,21 +2256,16 @@ static void generate (iCode *ic)
         if (!IS_ARRAY (arg->type) && getSize (arg->type) > 4 &&
             !(cpu6_bitint48 && IS_BITINT (arg->type) && getSize (arg->type) == 6))
           unsupported ("unsupported scalar parameter width");
-      emit ("%s:\n\tstx (-s)\n", symbol_name (OP_SYMBOL (ic->left)));
+      emit ("%s:\n", symbol_name (OP_SYMBOL (ic->left)));
+      if (use_y && use_z) emit ("\tpush xh,zl\n");
+      else if (use_y) emit ("\tpush xh,yl\n");
+      else if (use_z) emit ("\tstx (-s)\n\tpush zh,zl\n");
+      else emit ("\tstx (-s)\n");
+      adjust_frame (-frame, 'a');
+      if (frame_base) emit ("; CPU6 fixed frame window\n\tadd s,%u,z\n", frame_center);
       if (receives[0] || receives[1]) {
-        /* X's return link is saved; use X as scratch so incoming A/B remain
-           intact until both RECEIVE destinations have been initialized. */
-        if (use_y) emit ("\txfr y,x\n\tstx (-s)\n");
-        if (use_z) emit ("\txfr z,x\n\tstx (-s)\n");
-        adjust_frame (-frame, 'x');
-        if (frame_base) emit ("; CPU6 fixed frame window\n\tldx %u\n\tadd s,x\n\txfr x,z\n", frame_center);
         if (receives[1]) { store (receives[1]->result); receives[1]->generated = 1; }
         if (receives[0]) { emit ("\txfr a,b\n"); b_cached = NULL; store (receives[0]->result); receives[0]->generated = 1; }
-      } else {
-        if (use_y) emit ("\txfr y,a\n\tsta (-s)\n");
-        if (use_z) emit ("\txfr z,a\n\tsta (-s)\n");
-        adjust_frame (-frame, 'a');
-        if (frame_base) emit ("; CPU6 fixed frame window\n\tlda %u\n\tadd s,a\n\txaz\n", frame_center);
       }
       /* Back edges enter before parameter reloads, after frame allocation. */
       if (tail_body_label) emit ("L%u:\n", tail_body_label);
@@ -2114,11 +2273,17 @@ static void generate (iCode *ic)
         if (slots[i].parameter && slots[i].reg) {
           char reg = slots[i].reg;
           slots[i].reg = 0;
-          load (operandFromSymbol (slots[i].sym, false), 2);
-          slots[i].reg = reg;
-          emit ("\txfr b,%c\n", reg);
-          b_cached = slots[i].sym;
-          b_cached_width = slots[i].size;
+          if (slots[i].size == 2 && (reg == 'y' || reg == 'z')) {
+            emit ("\tldw %c,%u(s)\n", reg, (unsigned)stack_offset (slots[i].sym) & 65535);
+            slots[i].reg = reg;
+            b_cached = NULL;
+          } else {
+            load (operandFromSymbol (slots[i].sym, false), 2);
+            slots[i].reg = reg;
+            emit ("\txfr b,%c\n", reg);
+            b_cached = slots[i].sym;
+            b_cached_width = slots[i].size;
+          }
         }
       break;
     case ENDFUNCTION:
@@ -2137,7 +2302,7 @@ static void generate (iCode *ic)
          the function so its relocations follow it into an MMU page or overlay. */
       unsigned table = local_label++;
       load (ic->left, 2);
-      emit ("\tslr b\n\tlda L%u\n\taab\n\tldb (b)\n\tjmp (b)\nL%u:\n", table, table);
+      emit ("\tadd b,b\n\tadd L%u,b\n\tjmp @(b)\nL%u:\n", table, table);
       for (symbol *label = setFirstItem (IC_JTLABELS (ic)); label; label = setNextItem (IC_JTLABELS (ic)))
         emit ("\t.word L%d\n", label->key);
       b_cached = NULL;
@@ -2168,10 +2333,9 @@ static void generate (iCode *ic)
               "\tlda (__cpu6_mid48)\n\tiva\n\tsta (__cpu6_mid48)\n\tivr b\n");
         store (ic->result); break;
       }
-      if (width (ic->result) == 4) {
-        emit ("\tstb (-s)\n\tldb (__hireg)\n\tlda 65535\n\tore a,b\n\tstb (__hireg)\n\tldb (s+)\n");
-      }
-      emit ("\tlda 65535\n\tore a,b\n"); store (ic->result); break;
+      if (width (ic->result) == 4)
+        emit ("\tlda (__hireg)\n\tiva\n\tsta (__hireg)\n");
+      emit ("\tivr b\n"); store (ic->result); break;
     case UNARYMINUS:
       if (IS_FLOAT (operandType (ic->result))) {
         load (ic->left, 4);
@@ -2182,7 +2346,7 @@ static void generate (iCode *ic)
       if (width (ic->result) == 4) {
         emit ("\tcla\n\tsta (-s)\n\tsta (-s)\n"); pushed += 4;
         load (ic->left, 4); emit ("\tjsr __minusl\n"); pushed -= 4;
-      } else { load (ic->left, 2); emit ("\tcla\n\tsab\n"); }
+      } else { load (ic->left, 2); emit ("\tivr b,2\n"); }
       store (ic->result); break;
     case IFX: {
       unsigned label = local_label++;
@@ -2191,6 +2355,9 @@ static void generate (iCode *ic)
       }
       else if (width (ic->left) >= 4) {
         load (ic->left, width (ic->left)); emit ("\tlda (__hireg)\n\tori a,b\n");
+      }
+      else if (!cpu6_no_byte_arithmetic && width (ic->left) == 1) {
+        load_low_byte (ic->left, 'b'); emit ("\torib bl,bl\n");
       }
       else { load (ic->left, width (ic->left)); emit ("\tori b,b\n"); }
       if (width (ic->left) == 6) emit ("\tlda (__cpu6_mid48)\n\tori a,b\n");
@@ -2378,6 +2545,7 @@ void cpu6_assignRegisters (ebbIndex *ebbi)
   if (!options.nopeep && !cpu6_stack_only) {
     peepHole (&genLine.lineHead);
     if (cpu6AllocateAB (genLine.lineHead)) peepHole (&genLine.lineHead);
+    if (cpu6OptimizeLoops (genLine.lineHead)) peepHole (&genLine.lineHead);
   }
   /* Delay static-body selection until glue has resolved all data initializers
      (including function-pointer tables). The normal frontend marks references
