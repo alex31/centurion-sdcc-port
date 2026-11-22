@@ -188,7 +188,9 @@ static bool effects(lineNode *line, unsigned *reads, unsigned *writes)
   }
   if (!strcmp(op, "ivr") || !strcmp(op, "ivrb") || !strcmp(op, "iva")) {
     *reads = !strcmp(op, "iva") ? RA : regmask(a);
-    *writes = *reads | (*b ? FLAGS : NZ);
+    char *end;
+    long count = strtol(b, &end, 0);
+    *writes = *reads | (count > 1 && !*end ? FLAGS : NZ);
     return *reads != 0;
   }
   if (!strcmp(op, "add") || !strcmp(op, "sub") || !strcmp(op, "and") ||
@@ -218,16 +220,16 @@ static bool effects(lineNode *line, unsigned *reads, unsigned *writes)
     return true;
   }
   if (!strcmp(op, "inr") || !strcmp(op, "dcr") || !strcmp(op, "inrb") || !strcmp(op, "dcrb")) {
-    if (regmask(a)) { *reads = regmask(a); *writes = *reads | NZ; return true; }
+    if (regmask(a)) { *reads = regmask(a); *writes = *reads | NZ | OF; return true; }
     if ((!strcmp(op, "inr") || !strcmp(op, "dcr")) && strchr(a, '(')) {
       *reads = address_reads(a);
-      *writes = !strcmp(op, "dcr") ? FLAGS : (NZ | OF);
+      *writes = NZ | OF;
       return true;
     }
     return false;
   }
   if (!strcmp(op, "ina") || !strcmp(op, "dca") || !strcmp(op, "inx") || !strcmp(op, "dcx")) {
-    *reads = op[2] == 'x' ? RX : RA; *writes = *reads | NZ; return true;
+    *reads = op[2] == 'x' ? RX : RA; *writes = *reads | NZ | OF; return true;
   }
   if (!strcmp(op, "slr") || !strcmp(op, "srr") || !strcmp(op, "rrr") || !strcmp(op, "rlr") ||
       !strcmp(op, "slrb") || !strcmp(op, "srrb") || !strcmp(op, "rrrb") || !strcmp(op, "rlrb")) {
@@ -452,6 +454,17 @@ static bool word_register(const char *name)
   return mask == RA || mask == RB || mask == RX || mask == RY || mask == RZ;
 }
 
+/* Ordinary A/B loads and stores encode (register) in one byte. */
+static bool compact_word_address(const char *src)
+{
+  const char *paren = strchr(src, '(');
+  if (!paren || !paren[1] || !strchr("abxyzs", paren[1]) ||
+      paren[2] != ')' || paren[3]) return false;
+  if (src == paren) return true;
+  char *end;
+  return strtol(src, &end, 0) == 0 && end == paren;
+}
+
 bool cpu6canAssign(const char *dst, const char *src, const char *kind)
 {
   if (kind && !strcmp(kind, "byte-arithmetic"))
@@ -496,6 +509,11 @@ bool cpu6canAssign(const char *dst, const char *src, const char *kind)
   if (!strcmp(kind, "stable-memory"))
     return strchr(src, '(') && strchr(src, ')') && !address_writes(src) &&
            (address_reads(src) || strstr(src, "(_"));
+  /* A compact load/store plus its transfer or ALU operation totals two or
+     three bytes. The extended indexed form always takes four. */
+  if (optimize.codeSize && (!strcmp(kind, "extended-load") || !strcmp(kind, "extended-store") ||
+                            !strcmp(kind, "alu-memory")) && compact_word_address(src))
+    return false;
   if (!strcmp(kind, "extended-load"))
     return !address_writes(src) && !strchr(src, '@') && !regmask(src) &&
            !(src[0] == '(' && isdigit((unsigned char)src[1]));
@@ -508,7 +526,7 @@ bool cpu6canAssign(const char *dst, const char *src, const char *kind)
            (address_reads(src) || strstr(src, "(_"));
   if (!strcmp(kind, "rmw-memory"))
     return strchr(src, '(') && strchr(src, ')') && !address_writes(src) &&
-           !strchr(src, '@') && !(address_reads(src) & RA) &&
+           !strchr(src, '@') && !(address_reads(src) & (RA | regmask(dst))) &&
            (address_reads(src) || strstr(src, "(_"));
   if (!strcmp(kind, "small-const")) {
     char *end;
@@ -542,22 +560,24 @@ int cpu6instructionSize(lineNode *line)
   if (!strcmp(op, "push") || !strcmp(op, "pop")) return 2;
   if (!strcmp(op, "add") || !strcmp(op, "sub") || !strcmp(op, "and") ||
       !strcmp(op, "ori") || !strcmp(op, "ore"))
-    return (strchr(b, ',') || !regmask(a)) ? 4 : 2;
+    return regmask(a) && regmask(b) ? 2 : 4;
   if ((!strcmp(op, "inr") || !strcmp(op, "dcr")) && strchr(a, '(')) return 4;
+  /* Relaxable conditional jumps expand to a branch over a three-byte JMP. */
+  if (op[0] == 'j' && strcmp(op, "jmp") && strcmp(op, "jsr")) return 5;
   if (!effects(line, &reads, &writes)) return 999;
   if (branch_flag(op) || !strcmp(op, "bra")) return 2;
-  if (!strcmp(op, "jmp") || !strcmp(op, "jsr"))
-    return strchr(a, '(') && address_reads(a) ? 2 : 3;
-  if (!strncmp(op, "ld", 2) || !strncmp(op, "st", 2)) {
-    const char *paren = strchr(a, '(');
+  bool jump = !strcmp(op, "jmp") || !strcmp(op, "jsr");
+  if (jump || !strncmp(op, "ld", 2) || !strncmp(op, "st", 2)) {
+    bool indirect = a[0] == '@';
+    const char *addr = indirect ? a + 1 : a;
+    const char *paren = strchr(addr, '(');
     if (!paren) return !strcmp(op, "ldab") || !strcmp(op, "ldbb") ? 2 : 3;
-    /* Unlike ordinary 0(r), the assembler retains an explicit 0(r+)
-       displacement byte. Underestimating it can break short-branch range. */
-    if (address_writes(a)) return paren == a ? 2 : 3;
-    if (address_reads(a)) {
-      bool zero = paren == a || (paren == a + 1 && a[0] == '0');
-      if (zero) return !strcmp(op, "ldx") || !strcmp(op, "stx") ? 2 : 1;
-      return 3;
+    /* Autoindex encodes an explicit zero displacement, ordinary indexing
+       elides it. Jumps, indirect loads and X loads use an index byte. */
+    if (address_writes(addr)) return paren == addr ? 2 : 3;
+    if (address_reads(addr)) {
+      bool zero = paren == addr || (paren == addr + 1 && addr[0] == '0');
+      if (zero) return jump || indirect || !strcmp(op, "ldx") || !strcmp(op, "stx") ? 2 : 1;
     }
     return 3;
   }
@@ -812,7 +832,7 @@ static bool hoist_single_block_loop(lineNode *head, lineNode *rot_lbl, lineNode 
       if (p->isComment || p->isLabel) continue;
       unsigned r, w, dst;
       if (!effects(p, &r, &w)) break;
-      if (is_const_load(p, &dst) && !(prior_reads & dst) && flags_dead_after(p, head, w)) {
+      if (is_const_load(p, &dst) && !(prior_reads & (dst | (w & FLAGS))) && flags_dead_after(p, head, w)) {
         unsigned other_writes = 0;
         for (lineNode *q = rot_lbl->next; q && q != back_br; q = q->next) {
           if (q == p || q->isComment || q->isLabel) continue;
@@ -825,7 +845,7 @@ static bool hoist_single_block_loop(lineNode *head, lineNode *rot_lbl, lineNode 
           break;
         }
       }
-      prior_reads |= r & ~FLAGS;
+      prior_reads |= r;
     }
   }
   return changed;
@@ -859,7 +879,7 @@ bool cpu6OptimizeLoops(lineNode *head)
         if (invert_branch(eop)) exit_br = after_h2;
       }
     }
-    if (!exit_br || !is_pure_header_insn(h1)) continue;
+    if (!exit_br || exit_br->isInline || !is_pure_header_insn(h1)) continue;
 
     const char *inv = invert_branch(eop);
     if (!inv) continue;
@@ -876,7 +896,7 @@ bool cpu6OptimizeLoops(lineNode *head)
         break;
       }
     }
-    if (!back_br) continue;
+    if (!back_br || back_br->isInline) continue;
 
     /* Case 1: Countdown/countup flag reuse (xfr R,b or ori R,R; bz/bnz Lexit; ...; dcr/inr R; bra Lhead). */
     char test_reg = 0;
@@ -884,7 +904,7 @@ bool cpu6OptimizeLoops(lineNode *head)
       char hop[20], ha[256], hb[256];
       decode(h1->line, hop, ha, hb);
       if (!strcmp(hop, "xfr") && !strcmp(hb, "b") && strlen(ha) == 1 && strchr("xyz", ha[0]) &&
-          cpu6notUsed("b", exit_br, head))
+          cpu6notUsed("b", h1, head))
         test_reg = ha[0];
       else if (!strcmp(hop, "ori") && strlen(ha) == 1 && !strcmp(ha, hb) && strchr("abxyz", ha[0]))
         test_reg = ha[0];
@@ -925,4 +945,53 @@ bool cpu6OptimizeLoops(lineNode *head)
     }
   }
   return changed;
+}
+
+/* Earlier rewrites can grow a span after a short conditional was selected.
+   Keep the raw opcode when it fits even if every intervening conditional
+   expands. Otherwise let the assembler select the encoding using its final layout. */
+static bool short_branch_reaches(lineNode *branch, const char *target, bool backward)
+{
+  int remaining = backward ? 126 : 127; /* Relative to the following PC. */
+  for (lineNode *p = backward ? branch->prev : branch->next; p && remaining >= 0;
+       p = backward ? p->prev : p->next) {
+    if (p->isComment) continue;
+    if (p->isLabel) {
+      char label[256];
+      if (label_name(p, label) && !strcmp(target, label)) return true;
+      continue;
+    }
+    char op[20], a[256], b[256];
+    decode(p->line, op, a, b);
+    int size = cpu6instructionSize(p);
+    if (!p->isInline && branch_flag(op)) size = 5;
+    else if (!strcmp(op, "bra")) size = 3;
+    remaining -= size;
+  }
+  return false;
+}
+
+void cpu6FinalizeBranches(lineNode *head)
+{
+  /* Assembler mnemonics correspond to opcodes 0x10 through 0x19. */
+  static const struct { const char *op, *relaxable; } forms[] = {
+    {"bl", "jc"}, {"bnl", "jcc"}, {"bf", "jn"}, {"bnf", "jnc"},
+    {"bz", "jz"}, {"bnz", "jnz"}, {"bm", "jlt"}, {"bp", "jge"},
+    {"bgz", "jle"}, {"ble", "jgt"},
+  };
+  for (lineNode *p = head; p; p = p->next) {
+    if (p->isInline || p->isLabel || p->isComment) continue;
+    char op[20], target[256], unused[256];
+    decode(p->line, op, target, unused);
+    if (!branch_flag(op) || short_branch_reaches(p, target, false) ||
+        short_branch_reaches(p, target, true)) continue;
+    for (unsigned n = 0; n < sizeof(forms)/sizeof(forms[0]); n++) {
+      if (!strcmp(op, forms[n].op)) {
+        char text[280];
+        snprintf(text, sizeof(text), "%s %s", forms[n].relaxable, target);
+        replace_line(p, text);
+        break;
+      }
+    }
+  }
 }

@@ -1512,13 +1512,9 @@ static void arithmetic (iCode *ic)
     const char *mnemonic = ic->op == BITWISEAND ? "and" : ic->op == '|' ? "ori" : "ore";
     if (hi == identity || lo == identity) {
       load (ic->left, 4);
-      if (lo != identity) emit ("\tlda %u\n\t%s a,b\n", lo, mnemonic);
-      if (hi != identity) {
-        bool save_x = register_needed ('x');
-        if (save_x) emit ("\tstx (-s)\n");
-        emit ("\tlda (__hireg)\n\tldx %u\n\t%s x,a\n\tsta (__hireg)\n", hi, mnemonic);
-        if (save_x) emit ("\tldx (s+)\n");
-      }
+      if (lo != identity) emit ("\t%s %u,b\n", mnemonic, lo);
+      if (hi != identity)
+        emit ("\tlda (__hireg)\n\t%s %u,a\n\tsta (__hireg)\n", mnemonic, hi);
       b_cached = NULL;
       arithmetic_result (ic);
       return;
@@ -1550,34 +1546,12 @@ static void arithmetic (iCode *ic)
     load_long_part (ic->left, 2, 'a'); load_long_part (ic->right, 2, 'b');
     emit ("\t%s\n\tstb (-s)\n", instruction); pushed += 2;
     if (ic->op == '+' || ic->op == '-') {
-      /* Loads preserve L unless a distant stack slot must compute s+offset. */
-      bool direct_hi = true;
-      operand *ops[] = {ic->left, ic->right};
-      for (unsigned n = 0; n < 2; n++) {
-        if (!IS_SYMOP (ops[n])) continue;
-        symbol *s = OP_SYMBOL (ops[n]);
-        if (stacked (s)) {
-          int pos = stack_offset (s);
-          int zpos = pos - pushed - (int)frame_center;
-          if (!((pos >= -128 && pos <= 127) || (frame_base && zpos >= -128 && zpos <= 127)))
-            direct_hi = false;
-        }
-      }
-      if (direct_hi) {
-        unsigned no_carry = local_label++;
-        load_long_part (ic->left, 0, 'a'); load_long_part (ic->right, 0, 'b');
-        emit (ic->op == '+' ? "\tbnl L%u\n\tina\nL%u:\n\taab\n" : "\tbl L%u\n\tdca\nL%u:\n\tsab\n",
-              no_carry, no_carry);
-      } else {
-        unsigned no_carry = local_label++, join = local_label++;
-        emit (ic->op == '+' ? "\tbnl L%u\n" : "\tbl L%u\n", no_carry);
-        load_long_part (ic->left, 0, 'a'); load_long_part (ic->right, 0, 'b');
-        emit ("\t%s\n", instruction);
-        emit (ic->op == '+' ? "\tinr b\n" : "\tdcr b\n");
-        emit ("\tbra L%u\nL%u:\n", join, no_carry);
-        load_long_part (ic->left, 0, 'a'); load_long_part (ic->right, 0, 'b');
-        emit ("\t%s\nL%u:\n", instruction, join);
-      }
+      /* Both the short loads and the extended LDW used for far frame
+         slots preserve the link flag from the low-word operation. */
+      unsigned no_carry = local_label++;
+      load_long_part (ic->left, 0, 'a'); load_long_part (ic->right, 0, 'b');
+      emit (ic->op == '+' ? "\tbnl L%u\n\tina\nL%u:\n\taab\n" : "\tbl L%u\n\tdca\nL%u:\n\tsab\n",
+            no_carry, no_carry);
     } else {
       load_long_part (ic->left, 0, 'a'); load_long_part (ic->right, 0, 'b');
       emit ("\t%s\n", instruction);
@@ -2546,6 +2520,7 @@ void cpu6_assignRegisters (ebbIndex *ebbi)
     peepHole (&genLine.lineHead);
     if (cpu6AllocateAB (genLine.lineHead)) peepHole (&genLine.lineHead);
     if (cpu6OptimizeLoops (genLine.lineHead)) peepHole (&genLine.lineHead);
+    cpu6FinalizeBranches (genLine.lineHead);
   }
   /* Delay static-body selection until glue has resolved all data initializers
      (including function-pointer tables). The normal frontend marks references
