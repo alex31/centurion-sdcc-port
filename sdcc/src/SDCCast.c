@@ -30,6 +30,9 @@
 #include "dbuf_string.h"
 #include "SDCCbtree.h"
 #include "SDCCset.h"
+#if !OPT_DISABLE_CPU6
+#include "cpu6/bitbuiltins.h"
+#endif
 
 int currLineno = 0;
 set *astList = NULL;
@@ -633,6 +636,14 @@ resolveSymbols (ast *tree)
     {
       filename = tree->filename;
       lineno = tree->lineno;
+    }
+#endif
+
+#if !OPT_DISABLE_CPU6
+  if (TARGET_IS_CPU6 && cpu6IsBitBuiltin (tree))
+    {
+      tree->right = resolveSymbols (tree->right);
+      return tree;
     }
 #endif
 
@@ -3900,6 +3911,11 @@ decorateType (ast *tree, RESULT_TYPE resultType, bool reduceTypeAllowed)
   /* if already has type then do nothing */
   if (tree->decorated)
     return tree;
+
+#if !OPT_DISABLE_CPU6
+  if (TARGET_IS_CPU6 && cpu6IsBitBuiltin (tree))
+    return cpu6DecorateBitBuiltin (tree);
+#endif
 
   tree->decorated = 1;
 
