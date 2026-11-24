@@ -436,6 +436,19 @@ const char *cpu6SymbolName (symbol *sym)
   return symbol_name (sym);
 }
 
+/* CPY also reads the destination as it propagates a seed byte. Require an
+   actual allocated array, including the proof that both endpoints fit it. */
+bool cpu6FillArray (iCode *compare, const char *name, unsigned end)
+{
+  if (!compare || (compare->op != EQ_OP && compare->op != NE_OP) ||
+      !IS_SYMOP (compare->right)) return false;
+  cpu6_slot *slot = slot_for (OP_SYMBOL (compare->right));
+  symbol *sym = slot ? slot->address_base : NULL;
+  return sym && IS_ARRAY (sym->type) && !IS_VOLATILE (sym->etype) &&
+         !SPEC_ABSA (sym->etype) && !IS_EXTERN (sym->etype) && !SPEC_ADDRSPACE (sym->etype) &&
+         !strcmp (symbol_name (sym), name) && end == slot->address_offset && end <= getSize (sym->type);
+}
+
 static bool stacked (symbol *sym)
 {
   return sym->onStack || slot_for (sym);
@@ -740,6 +753,23 @@ static void load_long_part (operand *op, unsigned offset, char reg)
   load_scalar_part (op, offset, reg, 4);
 }
 
+/* Keep both halves in the arithmetic registers while lowering one iCode.
+   A forwarded long uses the ordinary __hireg:B convention. */
+static void load_long_pair (operand *op)
+{
+  if (!cpu6_stack_only && IS_SYMOP (op) && b_cached == OP_SYMBOL (op) && b_cached_width == 4)
+    emit ("\tlda (__hireg)\n");
+  else if (width (op) == 4 && (IS_SYMOP (op) ||
+                               (IS_VALOP (op) && !IS_FLOAT (operandType (op))))) {
+    load_long_part (op, 0, 'a');
+    load_long_part (op, 2, 'b');
+  } else {
+    load (op, 4);
+    emit ("\tlda (__hireg)\n");
+  }
+  b_cached = NULL;
+}
+
 /* A single-use temporary consumed first by the next instruction can remain
    in B. Other temporaries still have a physical home for later reloads. */
 static bool consumed_next (operand *op)
@@ -842,6 +872,22 @@ static void store (operand *op)
     emit ("\tstbb %s\n", mem);
     memory_done ();
   } else emit_word_store ('b', sym, size == 4 ? 2 : 0);
+}
+
+static void store_long_pair (operand *op)
+{
+  if (width (op) != 4) { store (op); return; }
+  if (!consumed_next (op)) {
+    emit_word_store ('a', OP_SYMBOL (op), 0);
+    emit_word_store ('b', OP_SYMBOL (op), 2);
+    b_cached = NULL;
+    return;
+  }
+  iCode *next = current_ic->next;
+  bool narrow = next->op == CAST && !IS_BOOL (operandType (next->result)) && width (next->result) <= 2;
+  if (!narrow) emit ("\tsta (__hireg)\n");
+  b_cached = OP_SYMBOL (op);
+  b_cached_width = narrow ? 2 : 4;
 }
 
 static void push (operand *op, unsigned size)
@@ -1001,9 +1047,8 @@ static void boolify (unsigned size, bool inverse)
    magnitude test also makes every NaN true, as required by C conversion. */
 static void float_truth (operand *op)
 {
-  load (op, 4);
-  emit ("\tstx (-s)\n\tldx 32767\n\tlda (__hireg)\n\tand x,a\n\tori a,b\n\tldx (s+)\n");
-  b_cached = NULL;
+  load_long_pair (op);
+  emit ("\tand 32767,a\n\tori a,b\n");
 }
 
 static const char *compare_name (unsigned op)
@@ -1135,6 +1180,32 @@ static void compare (iCode *ic)
     return;
   }
   if (size == 4) {
+    if (!cpu6_no_wide_native && branch && IS_VALOP (ic->right) &&
+        (ic->op == EQ_OP || ic->op == NE_OP || unsign)) {
+      uint32_t value = (uint32_t)operandLitValueUll (ic->right);
+      load_long_pair (ic->left);
+      if (ic->op == EQ_OP || ic->op == NE_OP) {
+        if (value >> 16) emit ("\tore %u,a\n", value >> 16);
+        if (value & 65535u) emit ("\tore %u,b\n", value & 65535u);
+        emit ("\tori a,b\n");
+        jump_condition (ic->op, true, branch, false);
+      } else {
+        /* SUB imm,reg computes imm-reg. Its link bit means reg <= imm.
+           Compare the low half only when the high halves match. */
+        bool strict = ic->op == '<' || ic->op == GE_OP;
+        if (strict && !value) emit ("\trl\n");
+        else {
+          if (strict) value--;
+          emit ("\tsub %u,a\n", value >> 16);
+          if ((value & 65535u) != 65535u) {
+            unsigned done = local_label++;
+            emit ("\tbnz L%u\n\tsub %u,b\nL%u:\n", done, value & 65535u, done);
+          }
+        }
+        jump_condition (ic->op == '<' || ic->op == LE_OP ? GE_OP : '<', true, branch, false);
+      }
+      return;
+    }
     if (!cpu6_no_wide_native && !optimize.codeSize && branch &&
         split_long_operand (ic->left) && split_long_operand (ic->right)) {
       b_cached = NULL;
@@ -1236,6 +1307,15 @@ static void arithmetic_result (iCode *ic)
   if (size == 6) emit ("\tlda (__cpu6_mid48)\n\tori a,b\n");
   else if (size == 1) emit ("\torib bl,bl\n");
   else emit ("\tori b,b\n");
+  jump_condition (NE_OP, true, branch, false);
+}
+
+static void long_pair_result (iCode *ic)
+{
+  iCode *branch = comparison_branch (ic);
+  if (!branch) { store_long_pair (ic->result); return; }
+  unsigned size = width (ic->result);
+  emit (size == 4 ? "\tori a,b\n" : size == 1 ? "\torib bl,bl\n" : "\tori b,b\n");
   jump_condition (NE_OP, true, branch, false);
 }
 
@@ -1341,16 +1421,23 @@ static void paired_word_division (iCode *ic, cpu6_div_pair *pair)
 static void constant_long_shift (iCode *ic, unsigned count)
 {
   bool left = ic->op == LEFT_OP, unsign = unsigned_op (ic->left);
-  load (ic->left, 4);
-  emit ("\tlda (__hireg)\n");
   if (count >= 16) {
+    /* Only one input word contributes. A volatile source still needs the
+       complete access. A forwarded high word lives in __hireg. */
+    if (width (ic->left) != 4 || isOperandVolatile (ic->left, false)) {
+      load_long_pair (ic->left);
+      emit (left ? "\txfr b,a\n" : "\txfr a,b\n");
+    } else if (!cpu6_stack_only && IS_SYMOP (ic->left) &&
+               b_cached == OP_SYMBOL (ic->left) && b_cached_width == 4) {
+      emit (left ? "\txfr b,a\n" : "\tldb (__hireg)\n");
+    } else load_long_part (ic->left, left ? 2 : 0, left ? 'a' : 'b');
+    b_cached = NULL;
     count -= 16;
     if (left) {
-      emit ("\txfr b,a\n\tclr b\n");
+      emit ("\tclr b\n");
       if (count >= 8) { emit ("\txfrb al,ah\n\tclrb al\n"); count -= 8; }
       if (count) emit ("\tslr a,%u\n", count);
     } else {
-      emit ("\txfr a,b\n");
       if (count >= 8) { emit ("\txfrb bh,bl\n"); extend_byte (unsign); count -= 8; }
       if (count && unsign) { emit ("\trl\n\trrr b\n"); count--; }
       if (count) emit ("\tsrr b,%u\n", count);
@@ -1361,6 +1448,7 @@ static void constant_long_shift (iCode *ic, unsigned count)
       }
     }
   } else {
+    load_long_pair (ic->left);
     if (count >= 8) {
       count -= 8;
       if (left) emit ("\txfrb al,ah\n\txfrb bh,al\n\txfrb bl,bh\n\tclrb bl\n");
@@ -1377,9 +1465,48 @@ static void constant_long_shift (iCode *ic, unsigned count)
       else emit (unsign ? "\trl\n\trrr a\n\trrr b\n" : "\tsrr a\n\trrr b\n");
     }
   }
-  emit ("\tsta (__hireg)\n");
-  b_cached = NULL;
-  arithmetic_result (ic);
+  long_pair_result (ic);
+}
+
+/* Extended ALU instructions can read one word from a frame or static object
+   without moving it through an arithmetic register. Both halves of the
+   other operand then stay in A:B across the link test. */
+static bool memory_long_arithmetic (iCode *ic)
+{
+  if (width (ic->result) != 4 || width (ic->left) != 4 || width (ic->right) != 4 ||
+      isOperandVolatile (ic->left, false) || isOperandVolatile (ic->right, false))
+    return false;
+  const char *mnemonic;
+  switch (ic->op) {
+    case '+': mnemonic = "add"; break;
+    case '-': mnemonic = "sub"; break;
+    case BITWISEAND: mnemonic = "and"; break;
+    case '|': mnemonic = "ori"; break;
+    case '^': mnemonic = "ore"; break;
+    default: return false;
+  }
+  operand *mem = ic->op == '-' ? ic->left : ic->right;
+  operand *other = mem == ic->left ? ic->right : ic->left;
+  if (!IS_SYMOP (mem)) return false;
+  symbol *sym = OP_SYMBOL (mem);
+  cpu6_slot *slot = slot_for (sym);
+  if (slot && (slot->transient || slot->address_base)) return false;
+  unsigned pos;
+  if (distant_stack_slot (sym, 0, &pos) || distant_stack_slot (sym, 2, &pos)) return false;
+  char low[400], high[400];
+  memory_operand (sym, 0, high, sizeof (high));
+  memory_operand (sym, 2, low, sizeof (low));
+  load_long_pair (other);
+  emit ("\t%s %s,b\n", mnemonic, low);
+  if (ic->op == '+' || ic->op == '-') {
+    unsigned done = local_label++;
+    /* For subtraction, a low-word borrow increases the subtrahend. */
+    emit (ic->op == '+' ? "\tbnl L%u\n" : "\tbl L%u\n", done);
+    emit ("\tina\nL%u:\n", done);
+  }
+  emit ("\t%s %s,a\n", mnemonic, high);
+  long_pair_result (ic);
+  return true;
 }
 
 static bool inplace_wide (iCode *ic)
@@ -1447,6 +1574,42 @@ static bool inplace_wide (iCode *ic)
   return true;
 }
 
+/* A short A-to-B transfer lets (2^n +/- 1) products fit in the four
+   bytes of immediate MUL. XAB takes 8 microcycles, SLR n takes 15+5n,
+   and AAB/SAB take 9. Even n=15 costs less than MUL's 116 cycles. */
+static void multiply_constant (operand *op, unsigned value)
+{
+  bool word_source = IS_SYMOP (op) && width (op) == 2 &&
+    !IS_ARRAY (operandType (op)) && !IS_FUNC (operandType (op)) &&
+    (cpu6_stack_only || b_cached != OP_SYMBOL (op));
+  unsigned plus = value - 1, minus = value + 1;
+  if (word_source && value > 2 && value < 65535 &&
+      (!(plus & (plus - 1)) || !(minus & (minus - 1)))) {
+    bool add = !(plus & (plus - 1));
+    unsigned shift = 0;
+    for (unsigned power = add ? plus : minus; power > 1; power >>= 1) shift++;
+    load_word_a (op);
+    emit ("\txab\n");
+    if (add && shift == 1) emit ("\taab\n");
+    else emit ("\tslr %c,%u\n", add ? 'b' : 'a', shift);
+    emit (add ? "\taab\n" : "\tsab\n");
+    b_cached = NULL;
+    return;
+  }
+  load (op, 2);
+  if (!value) emit ("\tclr b\n");
+  else if (value == 65535) emit ("\tivr b,2\n");
+  else if (value == 3) emit ("\txfr b,a\n\taab\n\taab\n");
+  else if (value & (value - 1)) emit ("\tmul %u,b\n", value);
+  else if (value != 1) {
+    unsigned shift = 0;
+    while ((value >>= 1)) shift++;
+    if (shift == 1) emit ("\tadd b,b\n");
+    else if (shift == 8 && !optimize.codeSize) emit ("\txfrb bl,bh\n\tclrb bl\n");
+    else emit ("\tslr b,%u\n", shift);
+  }
+}
+
 static void arithmetic (iCode *ic)
 {
   if (IS_FLOAT (operandType (ic->left)) || IS_FLOAT (operandType (ic->right)))
@@ -1469,7 +1632,7 @@ static void arithmetic (iCode *ic)
   if (pair && size <= 2) { paired_word_division (ic, pair); return; }
   if (size == 4 && !cpu6_no_wide_native && !cpu6_no_wide_shifts &&
       (ic->op == LEFT_OP || ic->op == RIGHT_OP) && IS_VALOP (ic->right) &&
-      (!optimize.codeSize || operandLitValue (ic->right) == 16 || operandLitValue (ic->right) == 24) &&
+      (!optimize.codeSize || operandLitValue (ic->right) >= 16) &&
       operandLitValue (ic->right) >= 0 && operandLitValue (ic->right) < 32) {
     constant_long_shift (ic, (unsigned)operandLitValue (ic->right)); return;
   }
@@ -1504,6 +1667,7 @@ static void arithmetic (iCode *ic)
     return;
   }
   if (size == 6) { arithmetic48 (ic); arithmetic_result (ic); return; }
+  if (size == 4 && !cpu6_no_wide_native && memory_long_arithmetic (ic)) return;
   if (size == 4 && !cpu6_no_wide_native && IS_VALOP (ic->right) &&
       (ic->op == BITWISEAND || ic->op == '|' || ic->op == '^')) {
     uint32_t mask = (uint32_t)operandLitValueUll (ic->right);
@@ -1595,45 +1759,7 @@ static void arithmetic (iCode *ic)
   if (size <= 2 && IS_VALOP (ic->right)) {
     unsigned value = (unsigned)(long long)operandLitValue (ic->right) & 65535;
     if (ic->op == '*') {
-      load (ic->left, 2);
-      if (!value) emit ("\tldb 0\n");
-      else if (value != 1) {
-        if (!(value & (value - 1))) {
-          unsigned count = 0;
-          while ((value >>= 1)) count++;
-          if (count >= 8) {
-            emit ("\txfrb bl,bh\n\tclrb bl\n");
-            count -= 8;
-            if (count) emit ("\tslrb bh,%u\n", count);
-          } else if (count == 1) emit ("\tadd b,b\n");
-          else emit ("\tslr b,%u\n", count);
-        } else {
-          unsigned bit = 0x8000, shifts = 0, cost = 15;
-          while (!(value & bit)) bit >>= 1;
-          for (unsigned scan = bit >> 1; scan; scan >>= 1) {
-            shifts++;
-            if (value & scan) { cost += (shifts == 1 ? 15 : 15 + 5 * shifts) + 10; shifts = 0; }
-          }
-          if (shifts) cost += shifts == 1 ? 15 : 15 + 5 * shifts;
-          /* Measured microcode costs: XFR B,A=15, ADD B,B=15, SLR B,n=15+5n, AAB=10,
-             immediate MUL=116. Combine consecutive shifts before comparing. */
-          if (optimize.codeSize || cost >= 116) emit ("\tmul %u,b\n", value);
-          else {
-            emit ("\txfr b,a\n");
-            shifts = 0;
-            while ((bit >>= 1)) {
-              shifts++;
-              if (value & bit) {
-                if (shifts == 1) emit ("\tadd b,b\n\taab\n");
-                else emit ("\tslr b,%u\n\taab\n", shifts);
-                shifts = 0;
-              }
-            }
-            if (shifts == 1) emit ("\tadd b,b\n");
-            else if (shifts) emit ("\tslr b,%u\n", shifts);
-          }
-        }
-      }
+      multiply_constant (ic->left, value);
       arithmetic_result (ic);
       return;
     }
@@ -1880,6 +2006,12 @@ static void pointer_get (iCode *ic)
   }
   if (IS_BITFIELD (type)) bitfield_get (type, slot, reg, offset);
   else {
+    if (size == 4) {
+      pointer_access ("lda", slot, reg, offset);
+      pointer_access ("ldb", slot, reg, offset + 2);
+      store_long_pair (ic->result);
+      return;
+    }
     if (size >= 4) {
       pointer_access ("lda", slot, reg, offset);
       emit ("\tsta (__hireg)\n");
@@ -2312,9 +2444,9 @@ static void generate (iCode *ic)
       emit ("\tivr b\n"); store (ic->result); break;
     case UNARYMINUS:
       if (IS_FLOAT (operandType (ic->result))) {
-        load (ic->left, 4);
-        emit ("\tstx (-s)\n\tldx 32768\n\tlda (__hireg)\n\tore x,a\n\tsta (__hireg)\n\tldx (s+)\n");
-        b_cached = NULL; store (ic->result); break;
+        load_long_pair (ic->left);
+        emit ("\tore 32768,a\n");
+        store_long_pair (ic->result); break;
       }
       if (width (ic->result) == 6) { arithmetic48 (ic); store (ic->result); break; }
       if (width (ic->result) == 4) {
@@ -2497,6 +2629,7 @@ void cpu6_assignRegisters (ebbIndex *ebbi)
   emit ("; CPU6 ABI %s frame=%d saved=%d variadic=%d asm=%u\n",
         FUNC_SDCCCALL (currFunc->type) ? "register" : "stack", frame, saved,
         IFFUNC_HASVARARGS (currFunc->type) != 0, function_asm);
+  if (optimize.codeSize) emit ("; CPU6 optimize for size\n");
   for (iCode *ic = chain; ic; ic = ic->next) {
     current_ic = ic;
     emit ("; ic %d: %u\n", ic->key, ic->op);

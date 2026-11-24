@@ -3335,6 +3335,11 @@ matchRule (lineNode * pl,
           continue;
         }
 
+      /* A CPU6 replacement must not consume inline assembly in the middle
+         of a window that began with compiler-generated instructions. */
+      if (TARGET_IS_CPU6 && spl->isInline)
+        return false;
+
       if (!matchLine (spl->line, rpl->line, &pr->vars))
         return false;
 

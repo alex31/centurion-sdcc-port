@@ -502,6 +502,21 @@ bool cpu6canAssign(const char *dst, const char *src, const char *kind)
   }
   if (!word_register(dst)) return false;
   if (!kind) return word_register(src);
+  if (!strcmp(kind, "alu-literal-or-direct")) {
+    if (!*src || strchr(src, '@') || strchr(src, ',') || regmask(src)) return false;
+    if (!strchr(src, '(')) return true;
+    return src[0] == '(' && src[1] == '_' && src[strlen(src)-1] == ')' &&
+           !address_reads(src);
+  }
+  if (!strcmp(kind, "pointer-cell"))
+    return !strchr(src, '@') && !address_writes(src) && strchr(src, '(') &&
+           (address_reads(src) || strstr(src, "(_"));
+  if (!strcmp(kind, "signed-byte-constant")) {
+    char *end;
+    long value = strtol(src, &end, 0);
+    return end != src && !*end && ((value >= -128 && value <= 127) ||
+                                   (value >= 0xff80 && value <= 0xffff));
+  }
   if (!strcmp(kind, "independent-address"))
     return !(address_reads(src) & regmask(dst)) && !address_writes(src);
   if (!strcmp(kind, "stable-load"))
@@ -552,20 +567,23 @@ int cpu6instructionSize(lineNode *line)
   char op[20], a[256], b[256]; unsigned reads, writes;
   decode(line->line, op, a, b);
   if (!strcmp(op, ".word") && !*b) return 2; /* one jump-table entry */
+  if (!strcmp(op, "cpy")) return 1;
   if ((!strcmp(op, "addb") || !strcmp(op, "subb") || !strcmp(op, "andb")) &&
       !strcmp(a, "al") && !strcmp(b, "bl")) return 1;
-  if (!strcmp(op, "mul") || !strcmp(op, "div"))
-    return regmask(a) && regmask(b) ? 2 : 4;
   if (!strcmp(op, "ldw") || !strcmp(op, "stw")) return 4;
   if (!strcmp(op, "push") || !strcmp(op, "pop")) return 2;
   if (!strcmp(op, "add") || !strcmp(op, "sub") || !strcmp(op, "and") ||
-      !strcmp(op, "ori") || !strcmp(op, "ore"))
-    return regmask(a) && regmask(b) ? 2 : 4;
+      !strcmp(op, "ori") || !strcmp(op, "ore") || !strcmp(op, "mul") || !strcmp(op, "div")) {
+    /* Peephole names such as "cf" can be ordinary assembler symbols. */
+    unsigned registers = RA | RB | RX | RY | RZ | RS;
+    return (regmask(a) & registers) && (regmask(b) & registers) ? 2 : 4;
+  }
   if ((!strcmp(op, "inr") || !strcmp(op, "dcr")) && strchr(a, '(')) return 4;
   /* Relaxable conditional jumps expand to a branch over a three-byte JMP. */
   if (op[0] == 'j' && strcmp(op, "jmp") && strcmp(op, "jsr")) return 5;
+  if (!strcmp(op, "bra") || !strcmp(op, "bsr")) return 3; /* May relax to two. */
   if (!effects(line, &reads, &writes)) return 999;
-  if (branch_flag(op) || !strcmp(op, "bra")) return 2;
+  if (branch_flag(op)) return 2;
   bool jump = !strcmp(op, "jmp") || !strcmp(op, "jsr");
   if (jump || !strncmp(op, "ld", 2) || !strncmp(op, "st", 2)) {
     bool indirect = a[0] == '@';
@@ -575,10 +593,8 @@ int cpu6instructionSize(lineNode *line)
     /* Autoindex encodes an explicit zero displacement, ordinary indexing
        elides it. Jumps, indirect loads and X loads use an index byte. */
     if (address_writes(addr)) return paren == addr ? 2 : 3;
-    if (address_reads(addr)) {
-      bool zero = paren == addr || (paren == addr + 1 && addr[0] == '0');
-      if (zero) return jump || indirect || !strcmp(op, "ldx") || !strcmp(op, "stx") ? 2 : 1;
-    }
+    if (compact_word_address(addr))
+      return jump || indirect || !strcmp(op, "ldx") || !strcmp(op, "stx") ? 2 : 1;
     return 3;
   }
   if (!strcmp(op, "xfr") && !strcmp(a, "a") && word_register(b) && strcmp(b, "a"))
@@ -765,6 +781,91 @@ static bool flags_dead_after(lineNode *line, lineNode *head, unsigned writes)
   return true;
 }
 
+/* The compiler spells a rematerialized static address as symbol+offset.
+   Keep the whole offset in the object, without wrapping the length. */
+static bool static_offset(const char *address, char symbol[256], unsigned *offset)
+{
+  unsigned n = 0;
+  if (*address != '_') return false;
+  while (isalnum((unsigned char)address[n]) || address[n] == '_') n++;
+  if (n >= 256 || address[n] != '+' || !isdigit((unsigned char)address[n + 1])) return false;
+  char *end;
+  unsigned long value = strtoul(address + n + 1, &end, 10);
+  if (*end || value > 65535) return false;
+  memcpy(symbol, address, n); symbol[n] = 0; *offset = (unsigned)value;
+  return true;
+}
+
+static bool outside_entry(lineNode *head, lineNode *label, lineNode *back)
+{
+  char name[256];
+  if (!label_name(label, name) || name[0] != 'L' || !isdigit((unsigned char)name[1])) return true;
+  size_t size = strlen(name);
+  for (lineNode *p = head; p; p = p->next) {
+    if (p == back || p->isComment || p->isLabel) continue;
+    if (p->isInline) return true;
+    for (const char *s = p->line; (s = strstr(s, name)); s += size)
+      if ((s == p->line || !(isalnum((unsigned char)s[-1]) || s[-1] == '_')) &&
+          !(isalnum((unsigned char)s[size]) || s[size] == '_')) return true;
+  }
+  return false;
+}
+
+/* Replace a single-entry byte-fill loop with a forward overlapping CPY.
+   Store one seed byte and copy each byte onto its successor. CPY encodes a
+   count minus one. The six replacement instructions occupy 14 bytes. */
+static bool block_fill(lineNode *head, lineNode *label, lineNode *compare,
+                       lineNode *exit, lineNode *back)
+{
+  char op[20], a[256], b[256], start[256], limit[256], addr[256], ptr[2] = {0};
+  unsigned first, last;
+  decode(exit->line, op, a, b);
+  if (strcmp(op, "bz")) return false;
+  lineNode *init = prev_real(label->prev);
+  while (init && init->isLabel) init = prev_real(init->prev);
+  if (!init) return false;
+  decode(init->line, op, a, b);
+  if (!strcmp(op, "ldx")) { ptr[0] = 'x'; strcpy(addr, a); }
+  else if (!strcmp(op, "ldw") && (!strcmp(a, "y") || !strcmp(a, "z"))) {
+    ptr[0] = a[0]; strcpy(addr, b);
+  } else return false;
+  if (!static_offset(addr, start, &first)) return false;
+  decode(compare->line, op, a, b);
+  char *dest = strrchr(b, ',');
+  if (strcmp(op, "sub") || strcmp(a, ptr) || !dest || strcmp(dest, ",b")) return false;
+  *dest = 0;
+  if (!static_offset(b, limit, &last) || strcmp(start, limit) || last < first + 2 ||
+      !cpu6FillArray(compare->ic, start, last)) return false;
+  lineNode *value = next_real(exit->next);
+  while (value && value->isLabel) value = next_real(value->next);
+  if (!value) return false;
+  decode(value->line, op, a, b);
+  if (strcmp(op, "ldbb") || !isdigit((unsigned char)*a) || *b) return false;
+  char *end;
+  unsigned long byte = strtoul(a, &end, 0);
+  if (*end || byte > 255) return false;
+  lineNode *store = next_real(value->next);
+  if (!store || next_real(store->next) != back) return false;
+  decode(store->line, op, a, b);
+  char index[8];
+  snprintf(index, sizeof(index), "(%c+)", ptr[0]);
+  if (strcmp(op, "stbb") || strcmp(a, index)) return false;
+  for (lineNode *p = init; p != back; p = p->next)
+    if (p->isInline || p->mightBeVolatileAccess || (p->isLabel && outside_entry(head, p, back)))
+      return false;
+  if (!flags_dead_after(back, head, FLAGS) || !cpu6notUsed("a", back, head) ||
+      !cpu6notUsed("b", back, head) || !cpu6notUsed("y", back, head) ||
+      !cpu6notUsed(ptr, back, head)) return false;
+  char text[320];
+  snprintf(text, sizeof(text), "ldb %s", addr); replace_line(init, text);
+  snprintf(text, sizeof(text), "ldab %lu", byte); replace_line(compare, text);
+  replace_line(exit, "stab (b)");
+  snprintf(text, sizeof(text), "ldw y,%s+%u", start, first + 1); replace_line(value, text);
+  snprintf(text, sizeof(text), "lda %u", last - first - 2); replace_line(store, text);
+  replace_line(back, "cpy");
+  return true;
+}
+
 static bool hoist_single_block_loop(lineNode *head, lineNode *rot_lbl, lineNode *back_br)
 {
   char rname[256];
@@ -898,6 +999,10 @@ bool cpu6OptimizeLoops(lineNode *head)
     }
     if (!back_br || back_br->isInline) continue;
 
+    if (!h2 && block_fill(head, line, h1, exit_br, back_br)) {
+      changed = true;
+      continue;
+    }
     /* Case 1: Countdown/countup flag reuse (xfr R,b or ori R,R; bz/bnz Lexit; ...; dcr/inr R; bra Lhead). */
     char test_reg = 0;
     if (!h2 && (!strcmp(eop, "bz") || !strcmp(eop, "bnz"))) {
@@ -965,7 +1070,6 @@ static bool short_branch_reaches(lineNode *branch, const char *target, bool back
     decode(p->line, op, a, b);
     int size = cpu6instructionSize(p);
     if (!p->isInline && branch_flag(op)) size = 5;
-    else if (!strcmp(op, "bra")) size = 3;
     remaining -= size;
   }
   return false;

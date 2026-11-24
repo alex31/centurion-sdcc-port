@@ -5,5 +5,6 @@ bool cpu6canAssign(const char *dst, const char *src, const char *kind);
 int cpu6instructionSize(lineNode *line);
 bool cpu6AllocateAB(lineNode *head);
 bool cpu6OptimizeLoops(lineNode *head);
+bool cpu6FillArray(iCode *compare, const char *name, unsigned end);
 void cpu6FinalizeBranches(lineNode *head);
 bool cpu6OperandAsm(const char *text);
