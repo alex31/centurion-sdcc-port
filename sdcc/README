@@ -1,2 +1,5 @@
 Please see doc/README.txt.
 
+For the Centurion CPU6 port, the distribution's SDK guide describes the
+compiler extensions, build drivers, runtime libraries, and verification.
+https://github.com/alex31/centurion_centos6_sdcc/blob/main/doc/sdcc.md
