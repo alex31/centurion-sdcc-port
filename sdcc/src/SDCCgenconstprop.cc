@@ -1627,10 +1627,12 @@ optimizeMult (iCode *ic)
     }
   else
     {
-      newoptype = newBitIntLink (16);
+      // Some ports support 16-bit unsigned int without supporting _BitInt.
+      if (port->s.bitint_maxwidth < 16 && bitsForType (UINTTYPE) != 16)
+        return;
+      newoptype = port->s.bitint_maxwidth < 16 ? newIntLink () : newBitIntLink (16);
       SPEC_USIGN (newoptype) = true;
-      newresulttype = newBitIntLink (16);
-      SPEC_USIGN (newresulttype) = true;
+      newresulttype = copyLinkChain (newoptype);
     }
   
   prependCast (ic, left, newoptype, 0);

@@ -1041,7 +1041,7 @@ bool cpu6OptimizeLoops(lineNode *head)
         lineNode *rot_lbl = insert_after(exit_br, lbl_def, true);
         lineNode *pos = back_br->prev;
         pos = insert_after(pos, h1->line, false);
-        if (h2) pos = insert_after(pos, h2->line, false);
+        if (h2) insert_after(pos, h2->line, false);
         snprintf(br_text, sizeof(br_text), "%s %s", inv, lbl_use);
         replace_line(back_br, br_text);
         hoist_single_block_loop(head, rot_lbl, back_br);

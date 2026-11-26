@@ -5256,7 +5256,7 @@ decorateType (ast *tree, RESULT_TYPE resultType, bool reduceTypeAllowed)
       return tree;
 
     case LEFT_OP:
-    case RIGHT_OP:
+    case RIGHT_OP: {
       if (!IS_INTEGRAL (LTYPE (tree)) || !IS_INTEGRAL (RTYPE (tree)))
         {
           werrorfl (tree->filename, tree->lineno, E_SHIFT_OP_INVALID);
@@ -5268,9 +5268,9 @@ decorateType (ast *tree, RESULT_TYPE resultType, bool reduceTypeAllowed)
           goto errorTreeReturn;
         }
 
-      /* make smaller type only if it's a LEFT_OP */
-      if (tree->opval.op == LEFT_OP)
-        tree->left = addCast (tree->left, resultTypeProp, true);
+      unsigned sourceWidth = bitsForType (LTYPE (tree));
+      if (!IS_BITINT (LTYPE (tree)) && sourceWidth < INTSIZE * 8)
+        sourceWidth = INTSIZE * 8;  /* integer promotions */
 
       propagateConstExpr (&tree->left, resultType, reduceTypeAllowed);
       propagateConstExpr (&tree->right, resultType, reduceTypeAllowed);
@@ -5282,6 +5282,11 @@ decorateType (ast *tree, RESULT_TYPE resultType, bool reduceTypeAllowed)
           rewriteAstNodeVal (tree, valShift (valFromType (LETYPE (tree)), valFromType (RETYPE (tree)), (tree->opval.op == LEFT_OP ? 1 : 0), reduceTypeAllowed));
           return decorateType (tree, resultType, reduceTypeAllowed);
         }
+
+      /* Fold constants at their promoted source width before the shift
+         is narrowed to suit an enclosing conversion. */
+      if (tree->opval.op == LEFT_OP)
+        tree->left = addCast (tree->left, resultTypeProp, true);
 
       /* see if this is a GETBYTE operation if yes
          then return that */
@@ -5341,7 +5346,8 @@ decorateType (ast *tree, RESULT_TYPE resultType, bool reduceTypeAllowed)
         {
           if (tree->opval.op == LEFT_OP || (tree->opval.op == RIGHT_OP && SPEC_USIGN (LETYPE (tree))))
             {
-              werrorfl (tree->filename, tree->lineno, W_SHIFT_CHANGED, (tree->opval.op == LEFT_OP ? "left" : "right"));
+              if (ullFromVal (valFromType (RETYPE (tree))) >= sourceWidth)
+                werrorfl (tree->filename, tree->lineno, W_SHIFT_CHANGED, (tree->opval.op == LEFT_OP ? "left" : "right"));
               /* Change shift op to comma op and replace the right operand with 0. */
               /* This preserves the left operand in case there were side-effects. */
               tree->right->opval.val = valZeroResultFromOp(LTYPE (tree), RTYPE (tree), tree->opval.op, reduceTypeAllowed);
@@ -5352,6 +5358,7 @@ decorateType (ast *tree, RESULT_TYPE resultType, bool reduceTypeAllowed)
         }
 
       return tree;
+    }
 
       /*------------------------------------------------------------------*/
       /*----------------------------*/
